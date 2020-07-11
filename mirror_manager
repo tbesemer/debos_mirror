@@ -1,0 +1,111 @@
+#!/bin/bash
+
+CUR_MIRROR_INDEX=`date +"w%U_%Y"`
+CUR_MIRROR_ROOT="/var/www/html/mirror"
+CUR_DEBIAN_RELEASE="stretch"
+LOG_FILE_ROOT="."
+
+PIP_FLIST_NAME="none"
+GIT_FLIST_NAME="none"
+WGET_FLIST_NAME="none"
+DEBIAN_RELEASE_NAME="none"
+
+BANDERSNATCH_IMAGE="pypy/bandersnatch:latest"
+
+show_opts() {
+
+    echo ""
+    echo "$0: Current Options"
+    echo ""
+    echo "CUR_MIRROR_INDEX:     $CUR_MIRROR_INDEX"
+    echo "CUR_MIRROR_ROOT:      $CUR_MIRROR_ROOT"
+    echo "LOG_FILE_ROOT:        $LOG_FILE_ROOT"
+    echo ""
+}
+
+show_help() {
+
+    echo ""
+    echo "$0: Peform all mirroring operations:"
+    echo "   -p file           # PIP Filelist."
+    echo "   -w file           # wget Filelist."
+    echo "   -g file           # git Filelist for bare clones."
+    echo "   -d release_name   # Debian release name, default [none]."
+    echo "   -r root_path      # Root Path, default </var/www/html/mirror>."
+    echo "   -l log_path       # Logfile Path, default <./>."
+    echo "   -s                # Show settings and exit."
+    echo "   -h                # Help."
+    echo ""
+    echo "  Actions are only taken on flags specified."
+    echo ""
+}
+
+
+while getopts ":hsp:w:g:d:r:l:" opt; do
+  case ${opt} in
+    p )
+      PIP_FLIST_NAME=$OPTARG
+      if [ ! -f $LOG_FILE_ROOT/$PIP_FLIST_NAME ]
+      then
+          echo "$0: Invalid PIP_FLIST_NAME <$LOG_FILE_ROOT/$PIP_FLIST_NAME>"
+          show_opts;
+          exit 1
+      fi
+      ;;
+    w )
+      WGET_FLIST_NAME=$OPTARG
+      if [ ! -f $LOG_FILE_ROOT/$WGET_FLIST_NAME ]
+      then
+          echo "$0: Invalid PIP_FLIST_NAME <$LOG_FILE_ROOT/$WGET_FLIST_NAME>"
+          show_opts;
+          exit 1
+      fi
+      ;;
+    g )
+      GIT_FLIST_NAME=$OPTARG
+      if [ ! -f $LOG_FILE_ROOT/$GIT_FLIST_NAME ]
+      then
+          echo "$0: Invalid PIP_FLIST_NAME <$LOG_FILE_ROOT/$GIT_FLIST_NAME>"
+          show_opts;
+          exit 1
+      fi
+      ;;
+    d )
+      DEBIAN_RELEASE_NAME=$OPTARG
+      ;;
+    r )
+      CUR_MIRROR_ROOT=$OPTARG
+      if [ ! -d $CUR_MIRROR_ROOT ]
+      then
+          echo "$0: Invalid CUR_MIRROR_ROOT <$CUR_MIRROR_ROOT>"
+          show_opts;
+          exit 1
+      fi
+      ;;
+    l )
+      LOG_FILE_ROOT=$OPTARG
+      if [ ! -d $LOG_FILE_ROOT ]
+      then
+          echo "$0: Invalid LOG_FILE_ROOT <$LOG_FILE_ROOT>"
+          show_opts;
+          exit 1
+      fi
+      ;;
+    s )
+      show_opts;
+      exit 0
+      ;;
+    h )
+      show_help;
+      ;;
+    \? )
+      echo "Invalid option: $OPTARG" 1>&2
+      show_help;
+      ;;
+    : )
+      echo "Invalid option: $OPTARG requires an argument" 1>&2
+      show_help;
+      ;;
+  esac
+done
+shift $((OPTIND -1))
