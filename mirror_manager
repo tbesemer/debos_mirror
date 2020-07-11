@@ -8,9 +8,10 @@ LOG_FILE_ROOT="."
 PIP_FLIST_NAME="none"
 GIT_FLIST_NAME="none"
 WGET_FLIST_NAME="none"
-DEBIAN_RELEASE_NAME="none"
+DEBIAN_RELEASE_NAME="stretch"
+DEBIAN_MIRROR_OP="no"
 
-BANDERSNATCH_IMAGE="pypy/bandersnatch:latest"
+BANDERSNATCH_IMAGE="pypa/bandersnatch:latest"
 
 show_opts() {
 
@@ -30,7 +31,8 @@ show_help() {
     echo "   -p file           # PIP Filelist."
     echo "   -w file           # wget Filelist."
     echo "   -g file           # git Filelist for bare clones."
-    echo "   -d release_name   # Debian release name, default [none]."
+    echo "   -d release_name   # Debian release name, default [stretch]."
+    echo "   -o                # Do Debian Mirror." 
     echo "   -r root_path      # Root Path, default </var/www/html/mirror>."
     echo "   -l log_path       # Logfile Path, default <./>."
     echo "   -s                # Show settings and exit."
@@ -38,6 +40,58 @@ show_help() {
     echo ""
     echo "  Actions are only taken on flags specified."
     echo ""
+}
+
+run_pip_mirror() {
+
+    #  Validate that we have correct input files.
+    #
+    if [ ! -f bandersnatch.conf-template ]
+    then
+        echo "$0: Missing <banderstantch.conf-template>"
+        exit 1
+    fi
+
+    if [ ! -f $LOG_FILE_ROOT/$PIP_FLIST_NAME ]
+    then
+        echo "$0: Missing <$LOG_FILE_ROOT/$PIP_FLIST_NAME>"
+        exit 1
+    fi
+
+    # Check for Bandersnatch, pull if missing.
+    #
+    echo "$0: Checking for [$BANDERSNATCH_IMAGE]"
+    docker inspect --type image $BANDERSNATCH_IMAGE &> /dev/null
+    if [ $? -ne 0 ]
+    then
+        echo "$0: [$BANDERSNATCH_IMAGE] missing, pulling"
+        docker pull $BANDERSNATCH_IMAGE
+        if [ $? -ne 0 ]
+        then
+            echo "$0: docker pull $BANDERSNATCH_IMAGE failed"
+            exit 1
+        fi
+    fi
+
+    #  Set the Mirror Root in Configuration.
+    #
+    FULL_MIRROR_PATH="$CUR_MIRROR_ROOT/pip/$DEBIAN_RELEASE_NAME/$CUR_MIRROR_INDEX"
+    cat bandersnatch.conf-template | awk -v rootdir="$FULL_MIRROR_PATH" \
+             '{sub( "__MIRROR_ROOT__", rootdir ); print }' >  bandersnatch.conf
+
+    #  Install the PIP package list.
+    #
+    while IFS="" read -r p || [ -n "$p" ]
+    do
+        printf '    %s\n' "$p" >> bandersnatch.conf
+    done < $LOG_FILE_ROOT/$PIP_FLIST_NAME
+
+    # Perform the mirror operation.
+    #
+    docker run -it --rm -v $PWD/bandersnatch.conf:/etc/bandersnatch.conf:ro \
+        -v ${CUR_MIRROR_ROOT}:${CUR_MIRROR_ROOT} pypa/bandersnatch:latest bandersnatch mirror
+
+    return $?
 }
 
 
@@ -109,3 +163,15 @@ while getopts ":hsp:w:g:d:r:l:" opt; do
   esac
 done
 shift $((OPTIND -1))
+
+#  Execute commands.
+#
+if [ $PIP_FLIST_NAME != "none" ]
+then
+    run_pip_mirror;
+    if [ $? -ne 0 ]
+    then
+        echo "$0: run_pip_mirror returned non-zero exit code"
+        exit 1
+    fi
+fi
