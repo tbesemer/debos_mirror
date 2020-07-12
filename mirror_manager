@@ -94,6 +94,51 @@ run_pip_mirror() {
     return $?
 }
 
+run_wget_mirror() {
+
+    # Validate we have list of wget paths
+    #
+    if [ ! -f $LOG_FILE_ROOT/$WGET_FLIST_NAME ]
+    then
+        echo "$0: Missing <$LOG_FILE_ROOT/$WGET_FLIST_NAME>"
+        exit 1
+    fi
+
+    #  Build full mirror path, and create directory.
+    #
+    FULL_MIRROR_PATH="$CUR_MIRROR_ROOT/wget/$DEBIAN_RELEASE_NAME/$CUR_MIRROR_INDEX"
+    mkdir -p $FULL_MIRROR_PATH
+    if [ $? -ne 0 ]
+    then
+        echo "$0: Failed to create <$FULL_MIRROR_PATH>"
+        exit 1
+    fi
+
+    #  Install the WGET package list.
+    # 
+    #  Note that the strings have long names with characters that
+    #  need to be escaped; if we read the list from a file wget
+    #  duplicates the name.
+    # 
+    #  We are allowing exit code of 8, which is general fetch
+    #  error - some Debian stuff doesn't exist.  Probably
+    #  should validate downloads better.  For now, just
+    #  check the logs after a mirror operation.
+    #
+    cp $LOG_FILE_ROOT/$WGET_FLIST_NAME $FULL_MIRROR_PATH
+    pushd $FULL_MIRROR_PATH 2>&1 > /dev/null
+    wget -o wget_normal_log.txt --rejected-log=wget_rejected_log.txt -i $WGET_FLIST_NAME
+    RSTAT=$?
+    if [ $RSTAT -ne 0 ] && [ $RSTAT -ne 8 ]
+    then
+        echo "$0: wget failed on mirror operation, $RSTAT"
+        popd
+        return 1
+    fi
+    popd 2>&1 > /dev/null
+
+    return 0
+}
 
 while getopts ":hsp:w:g:d:r:l:" opt; do
   case ${opt} in
@@ -172,6 +217,16 @@ then
     if [ $? -ne 0 ]
     then
         echo "$0: run_pip_mirror returned non-zero exit code"
+        exit 1
+    fi
+fi
+
+if [ $WGET_FLIST_NAME != "none" ]
+then
+    run_wget_mirror;
+    if [ $? -ne 0 ]
+    then
+        echo "$0: run_wget_mirror returned non-zero exit code"
         exit 1
     fi
 fi
