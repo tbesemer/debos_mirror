@@ -1,16 +1,26 @@
 #!/bin/bash
 
+# General mirror management settings.
+#
 CUR_MIRROR_INDEX=`date +"w%U_%Y"`
 CUR_MIRROR_ROOT="/var/www/html/mirror"
-CUR_DEBIAN_RELEASE="stretch"
 LOG_FILE_ROOT="."
 
+# Mirror operation settings.
+#
 PIP_FLIST_NAME="none"
 GIT_FLIST_NAME="none"
 WGET_FLIST_NAME="none"
 DEBIAN_RELEASE_NAME="stretch"
 DEBIAN_MIRROR_OP="no"
 
+# Debian specific settings.
+#
+DEBIAN_HOST=ftp.us.debian.org;
+DEBIAN_ARCH="amd64,i386"
+
+# Bandersnatch image. FIXME: Need to tie to a release that is cached.
+#
 BANDERSNATCH_IMAGE="pypa/bandersnatch:latest"
 
 show_opts() {
@@ -36,11 +46,31 @@ show_help() {
     echo "   -r root_path      # Root Path, default </var/www/html/mirror>."
     echo "   -l log_path       # Logfile Path, default <./>."
     echo "   -s                # Show settings and exit."
+    echo "   -a mirror_index   # Override automatich mirror index <wxx_yyyy."
     echo "   -h                # Help."
     echo ""
     echo "  Actions are only taken on flags specified."
     echo ""
 }
+
+run_debian_mirror() {
+
+    #  Set the Mirror Root in Configuration.
+    #
+    FULL_MIRROR_PATH="$CUR_MIRROR_ROOT/debian/$DEBIAN_RELEASE_NAME/$CUR_MIRROR_INDEX"
+
+    debmirror ${FULL_MIRROR_PATH} --ignore-release-gpg --nosource --method=rsync --host=${DEBIAN_HOST} \
+      --root=/debian --dist=${DEBIAN_RELEASE_NAME}  --section=main,contrib,non-free,main/debian-installer \
+      --i18n --arch=${DEBIAN_ARCH} --passive --cleanup -v -p
+    RSTAT=$?
+    if [ $RSTAT -ne 0 ]
+    then
+        echo "$0: debmirror failed on mirror operation, $RSTAT"
+        return 1
+    fi
+
+}
+
 
 run_pip_mirror() {
 
@@ -140,7 +170,7 @@ run_wget_mirror() {
     return 0
 }
 
-while getopts ":hsp:w:g:d:r:l:" opt; do
+while getopts ":hp:w:g:d:r:l:a:so" opt; do
   case ${opt} in
     p )
       PIP_FLIST_NAME=$OPTARG
@@ -190,6 +220,13 @@ while getopts ":hsp:w:g:d:r:l:" opt; do
           exit 1
       fi
       ;;
+    o )
+      DEBIAN_MIRROR_OP="yes"
+      ;;
+    a )
+      CUR_MIRROR_INDEX=$OPTARG
+      echo "$0: Override CUR_MIRROR_INDEX with [$CUR_MIRROR_INDEX]"
+      ;;
     s )
       show_opts;
       exit 0
@@ -227,6 +264,16 @@ then
     if [ $? -ne 0 ]
     then
         echo "$0: run_wget_mirror returned non-zero exit code"
+        exit 1
+    fi
+fi
+
+if [ $DEBIAN_MIRROR_OP == "yes" ]
+then
+    run_debian_mirror;
+    if [ $? -ne 0 ]
+    then
+        echo "$0: run_debian_mirror returned non-zero exit code"
         exit 1
     fi
 fi
