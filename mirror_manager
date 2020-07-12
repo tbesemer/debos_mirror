@@ -170,6 +170,52 @@ run_wget_mirror() {
     return 0
 }
 
+run_git_clones() {
+
+    # Validate we have list of git repositories
+    #
+    if [ ! -f $LOG_FILE_ROOT/$GIT_FLIST_NAME ]
+    then
+        echo "$0: Missing <$LOG_FILE_ROOT/$GIT_FLIST_NAME>"
+        exit 1
+    fi
+
+    #  Build full mirror path, and create directory.
+    #
+    FULL_MIRROR_PATH="$CUR_MIRROR_ROOT/git/$DEBIAN_RELEASE_NAME/$CUR_MIRROR_INDEX"
+    mkdir -p $FULL_MIRROR_PATH
+    if [ $? -ne 0 ]
+    then
+        echo "$0: Failed to create <$FULL_MIRROR_PATH>"
+        exit 1
+    fi
+
+    #  Bare Clone the git repositories.
+    #
+    #  FIXME: We need to make this more sophisticated, and
+    #  determine if we have internal/local clones already,
+    #  and in that case, pull those, and then pull from
+    #  the origianl upstream to get them current.
+    #
+    while IFS="" read -r p || [ -n "$p" ]
+    do
+        pushd $FULL_MIRROR_PATH 2>&1 > /dev/null
+        printf '%s\n' "$p"
+	git clone --bare $p
+        RSTAT=$?
+        popd 2>&1 > /dev/null
+
+        if [ $RSTAT -ne 0 ]
+        then
+            echo "$0: git clone --bare failed on $p, RSTAT==$RSTAT"
+            return 1
+        fi
+
+    done < $LOG_FILE_ROOT/$GIT_FLIST_NAME
+
+    return 0
+}
+
 while getopts ":hp:w:g:d:r:l:a:so" opt; do
   case ${opt} in
     p )
@@ -264,6 +310,16 @@ then
     if [ $? -ne 0 ]
     then
         echo "$0: run_wget_mirror returned non-zero exit code"
+        exit 1
+    fi
+fi
+
+if [ $GIT_FLIST_NAME != "none" ]
+then
+    run_git_clones;
+    if [ $? -ne 0 ]
+    then
+        echo "$0: run_git_clones returned non-zero exit code"
         exit 1
     fi
 fi
