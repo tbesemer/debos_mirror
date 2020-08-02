@@ -1,0 +1,15 @@
+set base_path    __MIRROR_ROOT__
+
+set nthreads    10
+
+set _tilde	0
+
+deb  http://ftp.us.debian.org/debian stretch main/debian-installer main contrib non-free
+deb  http://ftp.us.debian.org/debian stretch-updates main/debian-installer main contrib non-free
+deb  http://ftp.us.debian.org/debian stretch-backports main/debian-installer main contrib non-free
+deb  http://security.debian.org/debian-security stretch/updates main contrib non-free
+
+deb-src    http://ftp.us.debian.org/debian stretch main contrib non-free
+deb-src    http://security.debian.org/debian-security stretch/updates main 
+
+

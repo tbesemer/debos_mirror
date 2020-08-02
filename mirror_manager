@@ -17,6 +17,7 @@ DEBIAN_MIRROR_OP="no"
 # Debian specific settings.
 #
 DEBIAN_HOST=ftp.us.debian.org;
+DEBIAN_SECURITY_HOST=security.debian.org;
 DEBIAN_ARCH="amd64,i386"
 
 # Bandersnatch image. FIXME: Need to tie to a release that is cached.
@@ -59,16 +60,17 @@ run_debian_mirror() {
     #
     FULL_MIRROR_PATH="$CUR_MIRROR_ROOT/debian/$DEBIAN_RELEASE_NAME/$CUR_MIRROR_INDEX"
 
-    debmirror ${FULL_MIRROR_PATH} --ignore-release-gpg --nosource --method=rsync --host=${DEBIAN_HOST} \
-      --root=/debian --dist=${DEBIAN_RELEASE_NAME}  --section=main,contrib,non-free,main/debian-installer \
-      --i18n --arch=${DEBIAN_ARCH} --passive --cleanup -v -p
-    RSTAT=$?
-    if [ $RSTAT -ne 0 ]
-    then
-        echo "$0: debmirror failed on mirror operation, $RSTAT"
-        return 1
-    fi
+    cat mirror.list.template | awk -v rootdir="$FULL_MIRROR_PATH" \
+             '{sub( "__MIRROR_ROOT__", rootdir ); print }' >  mirror.list
 
+    sudo cp -p mirror.list /etc/apt/mirror.list
+    sudo apt-mirror
+
+    pushd $FULL_MIRROR_PATH
+    sudo mv mirror/ftp.us.debian.org/debian/ .
+    sudo mv mirror/security.debian.org/debian-security/ .
+    popd
+   
 }
 
 
