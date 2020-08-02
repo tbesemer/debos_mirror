@@ -63,6 +63,7 @@ run_debian_mirror() {
     cat mirror.list.template | awk -v rootdir="$FULL_MIRROR_PATH" \
              '{sub( "__MIRROR_ROOT__", rootdir ); print }' >  mirror.list
 
+    sudo mkdir -p $FULL_MIRROR_PATH
     sudo cp -p mirror.list /etc/apt/mirror.list
     sudo apt-mirror
 
