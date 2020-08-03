@@ -1,0 +1,3572 @@
+From bac250d71d695eb0bbccace166589c3c78fb83d1 Mon Sep 17 00:00:00 2001
+From: Kalimuthu-Velappan
+ <53821802+Kalimuthu-Velappan@users.noreply.github.com>
+Date: Thu, 12 Mar 2020 03:04:52 +0000
+Subject: [PATCH 1/2] [build]: support for DPKG local caching (#4117)
+
+DPKG caching framework provides the infrastructure to cache the sonic module/target .deb files into a local cache by tracking the target dependency files.SONIC build infrastructure is designed as a plugin framework where any new source code can be easily integrated into sonic as a module and that generates output as a .deb file. The source code compilation of a module is completely independent of other modules compilation. Inter module dependency is resolved through build artifacts like header files, libraries, and binaries in the form of Debian packages. For example module A depends on module B. While module A is being built, it uses B's .deb file to install it in the build docker.
+
+The DPKG caching framework provides an infrastructure that caches a module's deb package and restores it back to the build directory if its dependency files are not modified. When a module is compiled for the first time, the generated deb package is stored at the DPKG cache location. On the subsequent build, first, it checks the module dependency file modification. If none of the dependent files is changed, it copies the deb package from the cache location, otherwise, it goes for local compilation and generates the deb package. The modified files should be checked-in to get the newer cache deb package.
+
+This provides a huge improvement in build time and also supports the true incremental build by tracking the dependency files.
+
+- How I did it
+It takes two global arguments to enable the DPKG caching, the first one indicates the caching method and the second one describes the location of the cache.
+SONIC_DPKG_CACHE_METHOD=cache
+SONIC_DPKG_CACHE_SOURCE=
+
+    where  SONIC_DPKG_CACHE_METHOD - Default method is 'cache' for deb package caching
+                            none:     no caching
+                            cache:    cache from local directory
+Dependency file tracking:
+Dependency files are tracked for each target in two levels.
+1. Common make infrastructure files - rules/config, rules/functions, slave.mk etc.
+2. Per module files - files which are specific to modules, Makefile, debian/rules, patch files, etc.
+
+    For example: dependency files for Linux Kernel - src/sonic-linux-kernel,
+
+            SPATH       := $($(LINUX_HEADERS_COMMON)_SRC_PATH)
+            DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/linux-kernel.mk rules/linux-kernel.dep
+            DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
+            SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
+
+            DEP_FLAGS := $(SONIC_COMMON_FLAGS_LIST) \
+                         $(KERNEL_PROCURE_METHOD) $(KERNEL_CACHE_PATH)
+
+            $(LINUX_HEADERS_COMMON)_CACHE_MODE  := GIT_CONTENT_SHA
+            $(LINUX_HEADERS_COMMON)_DEP_FLAGS   := $(DEP_FLAGS)
+            $(LINUX_HEADERS_COMMON)_DEP_FILES   := $(DEP_FILES)
+            $(LINUX_HEADERS_COMMON)_SMDEP_FILES := $(SMDEP_FILES)
+            $(LINUX_HEADERS_COMMON)_SMDEP_PATHS := $(SPATH)
+Cache file tracking:
+The Cache file is a compressed TAR ball of a module's target DEB file and its derived-target DEB files.
+The cache filename is formed with the following format
+
+    FORMAT:
+            <module deb filename>.<24 byte of DEP SHA hash >-<24 byte of MOD SHA hash>.tgz
+            Eg:
+              linux-headers-4.9.0-9-2-common_4.9.168-1+deb9u3_all.deb-23658712fd21bb776fa16f47-c0b63ef593d4a32643bca228.tgz
+
+            < 24-byte DEP SHA value > - the SHA value is derived from all the dependent packages.
+            < 24-byte MOD SHA value > - the SHA value is derived from either of the following.
+                    GIT_COMMIT_SHA  - SHA value of the last git commit ID if it is a submodule
+                    GIT_CONTENT_SHA - SHA value is generated from the content of the target dependency files.
+Target Specific rules:
+Caching can be enabled/disabled on a global level and also on the per-target level.
+
+            $(addprefix $(DEBS_PATH)/, $(SONIC_DPKG_DEBS)) : $(DEBS_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(DEBS_PATH)/,$$($$*_DEPENDS))) \
+                    $(call dpkg_depend,$(DEBS_PATH)/%.dep )
+            $(HEADER)
+
+            # Load the target deb from DPKG cache
+            $(call LOAD_CACHE,$*,$@)
+
+            # Skip building the target if it is already loaded from cache
+            if [ -z '$($*_CACHE_LOADED)' ] ; then
+
+                  .....
+                 # Rules for Generating the target DEB file.
+                  .....
+
+                  # Save the target deb into DPKG cache
+                  $(call SAVE_CACHE,$*,$@)
+            fi
+
+            $(FOOTER)
+
+    The make rule-'$(call dpkg_depend,$(DEBS_PATH)/%.dep )' checks for target dependency file modification. If it is newer than the target, it will go for re-generation of that target.
+
+    Two main macros 'LOAD_CACHE' and 'SAVE_CACHE' are used for loading and storing the cache contents.
+    The 'LOAD_CACHE' macro is used to load the cache file from cache storage and extracts them into the target folder. It is done only if target dependency files are not modified by checking the GIT file status, otherwise, cache loading is skipped and full compilation is performed.
+    It also updates the target-specific variable to indicate the cache is loaded or not.
+    The 'SAVE_CACHE' macro generates the compressed tarball of the cache file and saves them into cache storage. Saving into the cache storage is protected with a lock.
+- How to verify it
+
+    The caching functionality is verified by enabling it in Linux kernel submodule.
+    It uses the cache directory as 'target/cache' where Linux cache file gets stored on the first-time build and it is picked from the cache location during the subsequent clean build.
+- Description for the changelog
+The DPKG caching framework provides the infrastructure to save the module-specific deb file to be cached by tracking the module's dependency files.
+If the module's dependency files are not changed, it restores the module deb files from the cache storage.
+
+- Description for the changelog
+
+- A picture of a cute animal (not mandatory but encouraged)
+
+DOCUMENT PR:
+
+https: //github.com/Azure/SONiC/pull/559
+Change-Id: I9fa11f8a932856e2657d9ab369903ae64d1a2a5b
+---
+ Makefile.cache                                     | 671 +++++++++++++++++++++
+ Makefile.work                                      |   9 +
+ platform/broadcom/docker-ptf-brcm.dep              |  10 +
+ platform/broadcom/docker-saiserver-brcm.dep        |  10 +
+ platform/broadcom/docker-syncd-brcm-rpc.dep        |  10 +
+ platform/broadcom/docker-syncd-brcm.dep            |  11 +
+ platform/broadcom/libsaithrift-dev.dep             |  13 +
+ platform/broadcom/one-aboot.dep                    |   2 +
+ platform/broadcom/one-image.dep                    |   2 +
+ platform/broadcom/one-pde-image.dep                |   2 +
+ platform/broadcom/platform-modules-accton.dep      |  10 +
+ .../broadcom/platform-modules-alphanetworks.dep    |  10 +
+ platform/broadcom/platform-modules-arista.dep      |  13 +
+ .../broadcom/platform-modules-brcm-xlr-gts.dep     |  10 +
+ platform/broadcom/platform-modules-cel.dep         |  10 +
+ platform/broadcom/platform-modules-dell.dep        |  10 +
+ platform/broadcom/platform-modules-delta.dep       |  10 +
+ platform/broadcom/platform-modules-ingrasys.dep    |  10 +
+ platform/broadcom/platform-modules-inventec.dep    |  10 +
+ platform/broadcom/platform-modules-juniper.dep     |  10 +
+ platform/broadcom/platform-modules-mitac.dep       |  10 +
+ platform/broadcom/platform-modules-quanta.dep      |  10 +
+ platform/broadcom/platform-modules-s6000.dep       |  10 +
+ platform/broadcom/raw-image.dep                    |   2 +
+ platform/broadcom/rules.dep                        |  25 +
+ platform/broadcom/sai-modules.dep                  |  10 +
+ platform/broadcom/sai.dep                          |  14 +
+ .../debian/files                                   |   2 -
+ .../sonic-platform-modules-juniper/debian/files    |   2 -
+ platform/vs/docker-sonic-vs.dep                    |  10 +
+ platform/vs/docker-syncd-vs.dep                    |  11 +
+ platform/vs/kvm-image.dep                          |   2 +
+ platform/vs/one-image.dep                          |   2 +
+ platform/vs/onie.dep                               |   2 +
+ platform/vs/rules.dep                              |   8 +
+ platform/vs/sonic-version.dep                      |   2 +
+ platform/vs/syncd-vs.dep                           |  11 +
+ rules/asyncsnmp-py3.dep                            |  12 +
+ rules/bash.dep                                     |  10 +
+ rules/config                                       |  12 +
+ rules/dbsyncd-py2.dep                              |  12 +
+ rules/dhcpmon.dep                                  |  10 +
+ rules/docker-base-stretch.dep                      |  10 +
+ rules/docker-base.dep                              |  10 +
+ rules/docker-config-engine-stretch.dep             |  10 +
+ rules/docker-config-engine.dep                     |  10 +
+ rules/docker-database.dep                          |  11 +
+ rules/docker-dhcp-relay.dep                        |  11 +
+ rules/docker-fpm-frr.dep                           |  11 +
+ rules/docker-fpm-gobgp.dep                         |  10 +
+ rules/docker-fpm-quagga.dep                        |  10 +
+ rules/docker-fpm.dep                               |  11 +
+ rules/docker-lldp-sv2.dep                          |  11 +
+ rules/docker-nat.dep                               |  11 +
+ rules/docker-orchagent.dep                         |  11 +
+ rules/docker-platform-monitor.dep                  |  11 +
+ rules/docker-ptf.dep                               |  10 +
+ rules/docker-router-advertiser.dep                 |  11 +
+ rules/docker-sflow.dep                             |  15 +
+ rules/docker-snmp-sv2.dep                          |  11 +
+ rules/docker-sonic-mgmt-framework.dep              |  11 +
+ rules/docker-sonic-mgmt-spytest.dep                |  11 +
+ rules/docker-sonic-mgmt.dep                        |  10 +
+ rules/docker-teamd.dep                             |  11 +
+ rules/docker-telemetry.dep                         |  11 +
+ rules/frr.dep                                      |  10 +
+ rules/functions                                    |  25 +
+ rules/gobgp.dep                                    |  10 +
+ rules/hiredis.dep                                  |  10 +
+ rules/ifupdown2.dep                                |  10 +
+ rules/initramfs-tools.dep                          |  10 +
+ rules/iproute2.dep                                 |  10 +
+ rules/iptables.dep                                 |  10 +
+ rules/isc-dhcp.dep                                 |  10 +
+ rules/ixgbe.dep                                    |  10 +
+ rules/kdump-tools.dep                              |  10 +
+ rules/libnl3.dep                                   |  10 +
+ rules/libteam.dep                                  |  10 +
+ rules/libyang.dep                                  |  10 +
+ rules/linux-kernel.dep                             |  15 +
+ rules/lldpd.dep                                    |  10 +
+ rules/lm-sensors.dep                               |  10 +
+ rules/monit.dep                                    |  10 +
+ rules/mpdecimal.dep                                |  10 +
+ rules/phy-credo.dep                                |   8 +
+ rules/ptf.dep                                      |  12 +
+ rules/python-click.dep                             |  10 +
+ rules/python3.dep                                  |  10 +
+ rules/quagga.dep                                   |  13 +
+ rules/radvd.dep                                    |  10 +
+ rules/redis-dump-load-py2.dep                      |  12 +
+ rules/redis.dep                                    |  10 +
+ rules/restapi.dep                                  |  12 +
+ rules/sairedis.dep                                 |  17 +
+ rules/scripts.dep                                  |   8 +
+ rules/sflow.dep                                    |  19 +
+ rules/smartmontools.dep                            |  10 +
+ rules/snmpd.dep                                    |  10 +
+ rules/socat.dep                                    |  10 +
+ rules/sonic-config.dep                             |  10 +
+ rules/sonic-daemon-base.dep                        |  10 +
+ rules/sonic-device-data.dep                        |  10 +
+ rules/sonic-ledd.dep                               |  14 +
+ rules/sonic-mgmt-framework.dep                     |  12 +
+ rules/sonic-platform-common.dep                    |  21 +
+ rules/sonic-psud.dep                               |  12 +
+ rules/sonic-syseepromd.dep                         |  12 +
+ rules/sonic-thermalctld.dep                        |  12 +
+ rules/sonic-utilities.dep                          |  12 +
+ rules/sonic-xcvrd.dep                              |  12 +
+ rules/sonic-ztp.dep                                |  13 +
+ rules/sonic-ztp.mk                                 |   3 -
+ rules/supervisor.dep                               |  10 +
+ rules/swig.dep                                     |  10 +
+ rules/swss-common.dep                              |  12 +
+ rules/swss.dep                                     |  12 +
+ rules/swsssdk-py2.dep                              |  12 +
+ rules/swsssdk-py3.dep                              |  12 +
+ rules/systemd-sonic-generator.dep                  |  10 +
+ rules/tacacs.dep                                   |  23 +
+ rules/telemetry.dep                                |  13 +
+ rules/template.dep                                 |  49 ++
+ rules/thrift.dep                                   |  10 +
+ slave.mk                                           | 347 +++++++----
+ 124 files changed, 2208 insertions(+), 127 deletions(-)
+ create mode 100644 Makefile.cache
+ create mode 100644 platform/broadcom/docker-ptf-brcm.dep
+ create mode 100644 platform/broadcom/docker-saiserver-brcm.dep
+ create mode 100644 platform/broadcom/docker-syncd-brcm-rpc.dep
+ create mode 100644 platform/broadcom/docker-syncd-brcm.dep
+ create mode 100644 platform/broadcom/libsaithrift-dev.dep
+ create mode 100644 platform/broadcom/one-aboot.dep
+ create mode 100644 platform/broadcom/one-image.dep
+ create mode 100644 platform/broadcom/one-pde-image.dep
+ create mode 100644 platform/broadcom/platform-modules-accton.dep
+ create mode 100644 platform/broadcom/platform-modules-alphanetworks.dep
+ create mode 100644 platform/broadcom/platform-modules-arista.dep
+ create mode 100644 platform/broadcom/platform-modules-brcm-xlr-gts.dep
+ create mode 100644 platform/broadcom/platform-modules-cel.dep
+ create mode 100644 platform/broadcom/platform-modules-dell.dep
+ create mode 100644 platform/broadcom/platform-modules-delta.dep
+ create mode 100644 platform/broadcom/platform-modules-ingrasys.dep
+ create mode 100644 platform/broadcom/platform-modules-inventec.dep
+ create mode 100644 platform/broadcom/platform-modules-juniper.dep
+ create mode 100644 platform/broadcom/platform-modules-mitac.dep
+ create mode 100644 platform/broadcom/platform-modules-quanta.dep
+ create mode 100644 platform/broadcom/platform-modules-s6000.dep
+ create mode 100644 platform/broadcom/raw-image.dep
+ create mode 100644 platform/broadcom/rules.dep
+ create mode 100644 platform/broadcom/sai-modules.dep
+ create mode 100644 platform/broadcom/sai.dep
+ delete mode 100644 platform/broadcom/sonic-platform-modules-brcm-xlr-gts/debian/files
+ delete mode 100644 platform/broadcom/sonic-platform-modules-juniper/debian/files
+ create mode 100644 platform/vs/docker-sonic-vs.dep
+ create mode 100644 platform/vs/docker-syncd-vs.dep
+ create mode 100644 platform/vs/kvm-image.dep
+ create mode 100644 platform/vs/one-image.dep
+ create mode 100644 platform/vs/onie.dep
+ create mode 100644 platform/vs/rules.dep
+ create mode 100644 platform/vs/sonic-version.dep
+ create mode 100644 platform/vs/syncd-vs.dep
+ create mode 100644 rules/asyncsnmp-py3.dep
+ create mode 100644 rules/bash.dep
+ create mode 100644 rules/dbsyncd-py2.dep
+ create mode 100644 rules/dhcpmon.dep
+ create mode 100644 rules/docker-base-stretch.dep
+ create mode 100644 rules/docker-base.dep
+ create mode 100644 rules/docker-config-engine-stretch.dep
+ create mode 100644 rules/docker-config-engine.dep
+ create mode 100644 rules/docker-database.dep
+ create mode 100644 rules/docker-dhcp-relay.dep
+ create mode 100644 rules/docker-fpm-frr.dep
+ create mode 100644 rules/docker-fpm-gobgp.dep
+ create mode 100644 rules/docker-fpm-quagga.dep
+ create mode 100644 rules/docker-fpm.dep
+ create mode 100644 rules/docker-lldp-sv2.dep
+ create mode 100644 rules/docker-nat.dep
+ create mode 100644 rules/docker-orchagent.dep
+ create mode 100644 rules/docker-platform-monitor.dep
+ create mode 100644 rules/docker-ptf.dep
+ create mode 100644 rules/docker-router-advertiser.dep
+ create mode 100644 rules/docker-sflow.dep
+ create mode 100644 rules/docker-snmp-sv2.dep
+ create mode 100644 rules/docker-sonic-mgmt-framework.dep
+ create mode 100644 rules/docker-sonic-mgmt-spytest.dep
+ create mode 100644 rules/docker-sonic-mgmt.dep
+ create mode 100644 rules/docker-teamd.dep
+ create mode 100644 rules/docker-telemetry.dep
+ create mode 100644 rules/frr.dep
+ create mode 100644 rules/gobgp.dep
+ create mode 100644 rules/hiredis.dep
+ create mode 100644 rules/ifupdown2.dep
+ create mode 100644 rules/initramfs-tools.dep
+ create mode 100644 rules/iproute2.dep
+ create mode 100644 rules/iptables.dep
+ create mode 100644 rules/isc-dhcp.dep
+ create mode 100644 rules/ixgbe.dep
+ create mode 100644 rules/kdump-tools.dep
+ create mode 100644 rules/libnl3.dep
+ create mode 100644 rules/libteam.dep
+ create mode 100644 rules/libyang.dep
+ create mode 100644 rules/linux-kernel.dep
+ create mode 100644 rules/lldpd.dep
+ create mode 100644 rules/lm-sensors.dep
+ create mode 100644 rules/monit.dep
+ create mode 100644 rules/mpdecimal.dep
+ create mode 100644 rules/phy-credo.dep
+ create mode 100644 rules/ptf.dep
+ create mode 100644 rules/python-click.dep
+ create mode 100644 rules/python3.dep
+ create mode 100644 rules/quagga.dep
+ create mode 100644 rules/radvd.dep
+ create mode 100644 rules/redis-dump-load-py2.dep
+ create mode 100644 rules/redis.dep
+ create mode 100644 rules/restapi.dep
+ create mode 100644 rules/sairedis.dep
+ create mode 100644 rules/scripts.dep
+ create mode 100644 rules/sflow.dep
+ create mode 100644 rules/smartmontools.dep
+ create mode 100644 rules/snmpd.dep
+ create mode 100644 rules/socat.dep
+ create mode 100644 rules/sonic-config.dep
+ create mode 100644 rules/sonic-daemon-base.dep
+ create mode 100644 rules/sonic-device-data.dep
+ create mode 100644 rules/sonic-ledd.dep
+ create mode 100644 rules/sonic-mgmt-framework.dep
+ create mode 100644 rules/sonic-platform-common.dep
+ create mode 100644 rules/sonic-psud.dep
+ create mode 100644 rules/sonic-syseepromd.dep
+ create mode 100644 rules/sonic-thermalctld.dep
+ create mode 100644 rules/sonic-utilities.dep
+ create mode 100644 rules/sonic-xcvrd.dep
+ create mode 100644 rules/sonic-ztp.dep
+ create mode 100644 rules/supervisor.dep
+ create mode 100644 rules/swig.dep
+ create mode 100644 rules/swss-common.dep
+ create mode 100644 rules/swss.dep
+ create mode 100644 rules/swsssdk-py2.dep
+ create mode 100644 rules/swsssdk-py3.dep
+ create mode 100644 rules/systemd-sonic-generator.dep
+ create mode 100644 rules/tacacs.dep
+ create mode 100644 rules/telemetry.dep
+ create mode 100644 rules/template.dep
+ create mode 100644 rules/thrift.dep
+
+diff --git a/Makefile.cache b/Makefile.cache
+new file mode 100644
+index 0000000..b1e5903
+--- /dev/null
++++ b/Makefile.cache
+@@ -0,0 +1,671 @@
++#######################################################################
++#
++#   Copyright (c) 2020 Broadcom, Inc.
++#   The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
++#
++#   Author: Kalimuthu Velappan
++#           Greg Paussa
++#
++#   Email : kalimuthu.velappan@broadcom.com
++#           greg.paussa@broadcom.com
++#  
++#   This program is free software; you can redistribute it and/or modify
++#   it under the terms of the GNU General Public License as published by
++#   the Free Software Foundation; either version 2 of the License, or
++#   (at your option) any later version.
++#  
++#   This program is distributed in the hope that it will be useful,
++#   but WITHOUT ANY WARRANTY; without even the implied warranty of
++#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++#   GNU General Public License for more details.
++#
++#######################################################################
++#
++#
++#            DPKG caching framework
++#
++# SONiC source code composes of multiple open source modules. Eg: Linux, bash, ntp etc.
++# Each module considered as a build target in the sonic build framework.
++# Each module gets compiled and generate the final debian package(.deb) file.
++# There are two types of source code packages used by the SONiC repo.
++#
++#         1. Module source code is maintained as part of main repo
++#                 Eg: sonic-utilities, Plaform files etc
++#
++#             Some module source code is maintained outside the sonic repo, but
++#             the build framework is part of sonic main repo.
++#             The build framework downloads the zipped source content from the web,
++#             applies a series of patches (if applicable) on the downloaded source code,
++#             compiles the source and generates the final .deb package(s).
++#                 Eg: bash, ntp, etc
++#
++#         2. Module source code is maintained as a submodule(SM) in the sonic repo.
++#             Eg: Frr, swss, Linux etc
++#
++#
++# The sonic build framework uses the module .deb packages that are generated as part of build and
++# creates  the set of target docker images and the final binary image for distribution.
++#
++# The caching framework provides the method to cache the module .deb packages and docker images
++# into a cache location by tracking module dependency information.
++#
++# A module can have a set of dependency files, for example Makefiles, source files, scripts, dpkg control files, etc.
++# The caching is done based on the SHA hash value of the module dependency file contents. If one of the
++# dependency files is changed, the corresponding cache file is also changed. So it automatically creates the new cache file
++# for that module.
++#
++# It provides two levels of caching.
++#     Global cache := Module doesnt have any local changes.
++#     Local cache  := Used for target when one of its dependency file is modified.
++#
++#
++# Steps for adding new module is given as a template.
++# Template File : rules/template.dep
++#
++
++
++# Common files and FLAGS
++# Run the 'touch cache.skip.common' command in the base directory to exclude the common files from caching
++SONIC_COMMON_FILES_LIST :=  $(if $(wildcard cache.skip.common),, .platform slave.mk rules/functions Makefile.cache)
++SONIC_COMMON_FLAGS_LIST :=  $(CONFIGURED_PLATFORM) \
++                            $(SONIC_DPKG_CACHE_SOURCE) $(SONIC_DEBUGGING_ON) \
++                            $(SONIC_PROFILING_ON) $(SONIC_SANITIZER_ON)
++SONIC_COMMON_DPKG_LIST  :=  debian/control debian/changelog debian/rules \
++                            debian/compat debian/install debian/copyright
++SONIC_COMMON_BASE_FILES_LIST  := sonic-slave-jessie/Dockerfile.j2 sonic-slave-jessie/Dockerfile.user \
++                                 sonic-slave-stretch/Dockerfile.j2 sonic-slave-stretch/Dockerfile.user
++
++
++
++include $(RULES_PATH)/*.dep
++
++
++ifneq ($(CONFIGURED_PLATFORM), undefined)
++ifeq ($(PDDF_SUPPORT), y)
++include $(PLATFORM_PDDF_PATH)/rules.dep
++endif
++
++-include $(PLATFORM_PATH)/rules.dep
++endif
++
++$(info "SONIC_DPKG_CACHE_METHOD"         : "$(SONIC_DPKG_CACHE_METHOD)")
++ifneq ($(SONIC_DPKG_CACHE_METHOD),none)
++$(info "DPKG_CACHE_PATH"                 : "$(SONIC_DPKG_CACHE_SOURCE)")
++endif
++$(info )
++
++
++###############################################################################
++## Canned sequences
++###############################################################################
++
++SONIC_DPKG_CACHE_DIR    := /dpkg_cache
++MOD_CACHE_LOCK_SUFFIX   := cache_access
++MOD_CACHE_LOCK_TIMEOUT  := 3600
++SONIC_DPKG_LOCAL_CACHE_DIR=${TARGET_PATH}/cache
++$(shell test -d $(SONIC_DPKG_LOCAL_CACHE_DIR) || \
++    mkdir -p $(SONIC_DPKG_LOCAL_CACHE_DIR) && chmod 777 $(SONIC_DPKG_LOCAL_CACHE_DIR) )
++$(shell test -w $(SONIC_DPKG_CACHE_DIR) || sudo chmod 777 $(SONIC_DPKG_CACHE_DIR) ) 
++
++DOCKER_LOCKFILE_SUFFIX  := access
++DOCKER_LOCKFILE_TIMEOUT := 1200
++
++# Lock macro for shared file access
++# Lock is implemented through flock command with a specified timeout value
++# Lock file is created in the specified directory, a separate one for each target file name
++# A designated suffix is appended to each target file name, followed by .lock
++#
++# Parameters:
++#  $(1) - target file name (without path)
++#  $(2) - lock file path (only)
++#  $(3) - designated lock file suffix
++#  $(4) - flock timeout (in seconds)
++#
++# $(call MOD_LOCK,file,path,suffix,timeout)
++define MOD_LOCK
++	if [[ ! -f $(2)/$(1)_$(3).lock ]]; then
++		touch $(2)/$(1)_$(3).lock
++		chmod 777 $(2)/$(1)_$(3).lock;
++	fi
++	$(eval $(1)_lock_fd=$(subst ~,_,$(subst -,_,$(subst +,_,$(subst .,_,$(1))))))
++	exec {$($(1)_lock_fd)}<>"$(2)/$(1)_$(3).lock";
++	if ! flock -x -w $(4) "$${$($(1)_lock_fd)}" ; then
++		echo "ERROR: Lock timeout trying to access $(2)/$(1)_$(3).lock";
++		exit 1;
++	fi
++endef
++
++# UnLock macro for shared file access
++#
++# Parameters:
++#  $(1) - target file name (without path)
++#
++# $(call MOD_UNLOCK,file)
++define MOD_UNLOCK
++	eval exec "$${$($(1)_lock_fd)}<&-";
++endef
++
++
++# Calculate the 24 byte SHA value
++# GIT_COMMIT_SHA  => SHA is derived from last git commit ID
++# GIT_CONTENT_SHA => SHA is derived from contents of depdency files
++# Args:
++#  $(1)   => target name
++define GET_MOD_SHA
++	$(eval  $(1)_MOD_DEP_FILES := $($(1)_DEP_FLAGS_FILE) $($(1)_MOD_HASH_FILE) $($(1)_SMOD_HASH_FILE) )
++	$(if $(MDEBUG), $(info $(1)_MOD_DEP_FILES: $($(1)_MOD_DEP_FILES)))
++	$(eval $(1)_MOD_HASH    := $(if $(filter GIT_COMMIT_SHA,$($(1)_CACHE_MODE)),\
++                            $(shell cd $($(1)_MOD_SRC_PATH) && git log -1 --format="%H"| awk '{print substr($$1,0,23);}' ),\
++                            $(shell git hash-object $($(1)_MOD_DEP_FILES)| \
++                                   sha1sum | awk '{print substr($$1,0,23);}')))
++endef
++
++
++# Calculate the 24 byte SHA value
++# SHA value is derived from dependent files of the target which includes .flags, .sha and .smsha files.
++# Args:
++#  $(1)   => target name
++define GET_MOD_DEP_SHA
++	$(eval $(1)_MOD_DEP_PKGS := $(foreach dfile,$($(1)_DEPENDS) $($(1)_RDEPENDS) $($(1)_WHEEL_DEPENDS) \
++                            $($(1)_PYTHON_DEBS) $($(1)_PYTHON_WHEELS) \
++                            $($(1)_DBG_DEPENDS) $($(1)_DBG_IMAGE_PACKAGES) $($(1)_LOAD_DOCKERS),\
++                            $(if $($(dfile)_MAIN_DEB),$($(dfile)_MAIN_DEB),$(dfile))) )
++
++	$(if $(MDEBUG), $(info $(1)_MOD_DEP_PKGS: $($(1)_MOD_DEP_PKGS)))
++	$(eval $(1)_DEP_MOD_SHA := $(shell git hash-object  \
++                            $(foreach dfile,$($(1)_MOD_DEP_PKGS), $($(dfile)_DEP_FLAGS_FILE) $($(dfile)_MOD_HASH_FILE) $($(dfile)_SMOD_HASH_FILE) ) \
++                            | sha1sum | awk '{print substr($$1,0,23);}'))
++endef
++
++
++# Retrive the list of files that are modified for the target. The files can be from
++# 1. Any of dependent target is modified
++# 2. Files from the target dependency list
++# 3. Files from submodule dependency list if the target is a submodule
++#
++# Args:
++#  $(1)   => target name
++define GET_MODIFIED_FILES
++	$(eval $(1)_FILES_MODIFIED := $(foreach dfile,$($(1)_MOD_DEP_PKGS),$(if $($(dfile)_FILES_MODIFIED),$(dfile))) \
++                                  $(if $($(1)_DEP_FILES), $(shell cat $($(1)_MOD_DEP_FILE) | xargs git status -s)) \
++                                  $(if $($(1)_SMDEP_PATHS), $(foreach path,$($(1)_SMDEP_PATHS), \
++                                        $(shell cd $(path) &&  git status --ignore-submodules=all -s -uno .))) )
++
++endef
++
++# Loads the deb package from debian cache
++# Cache file prefix is formed using SHA value
++# The SHA value consists of
++#   1.  24 byte SHA value is derived from the dependency files list
++#          Flags: Module ENV flags file
++#          Dependent packages : DEPENDS, RDEPENDS, WHEEL_DEPENDS, PYTHON_DEBS, PYTHON_WHEELS, DBG_DEPENDS, DBG_IMAGE_PACKAGES, LOAD_DOCKERS
++#   2.  24 byte SHA value from one of the keyword type - GIT_COMMIT_SHA or GIT_CONTENT_SHA
++#          GIT_COMMIT_SHA   - SHA value of the last git commit id if it is a submodule
++#          GIT_CONTENT_SHA  - SHA value is calculated from the target dependency files content.
++#   Cache is loaded from either local cache or global cache based on the dependency SHA match with the cache filename.
++#   Otherwise it builds the package from source.
++# TODO:
++# 1. Extend dpkg for all the chip vendor packages.
++
++# Args:
++# $(1) => target name
++# $(2) => target output file name
++define LOAD_FROM_CACHE
++
++	# Calculate the modules SHA and its dependency SHA value
++	$(call GET_MOD_DEP_SHA,$(1))
++	$(call GET_MOD_SHA,$(1))
++
++	# Form the cache file name
++	$(eval $(1)_MOD_CACHE_FILE := $(1)-$($(1)_DEP_MOD_SHA)-$($(1)_MOD_HASH).tgz)
++	$(if $(MDEBUG), $(info $(1)_MODE_CACHE_FILE := $($(1)_MOD_CACHE_FILE)))
++
++	# Retrive and log files list that are modified for the target.
++	$(call GET_MODIFIED_FILES,$(1))
++	$(if $($(1)_FILES_MODIFIED),
++		echo "Target $(1) dependencies are modifed - global cache skipped" >> $($(1)_DST_PATH)/$(1).log
++		echo "Modified dependencies are : [$($(1)_FILES_MODIFIED)] " >> $($(1)_DST_PATH)/$(1).log
++		$(eval $(1)_CACHE_DIR := $(SONIC_DPKG_LOCAL_CACHE_DIR)))
++
++	# Choose the cache file path in the following order
++	# 1. First load from Local cache path
++	# 2. If not, load from global cache path
++	$(eval CACHE_FILE_SELECT:=$(or $(wildcard $(SONIC_DPKG_LOCAL_CACHE_DIR)/$($(1)_MOD_CACHE_FILE)), \
++								$(wildcard $(SONIC_DPKG_CACHE_DIR)/$($(1)_MOD_CACHE_FILE))) )
++
++	# Check if any of the derived package is not built
++	$(eval LOAD_DRV_DEB := $(foreach pkg,$(addprefix $($(1)_DST_PATH)/,$(1) $($(1)_DERIVED_DEBS) $($(1)_EXTRA_DEBS)),$(if $(wildcard $(pkg)),,$(pkg))))
++
++	# Load the cache if cache is enabled and cache file is present in the cache
++	# Update the cache_loaded variable
++	$(if $(and $(CACHE_FILE_SELECT),$(filter $(RCACHE_OPTIONS),$(SONIC_DPKG_CACHE_METHOD))),
++		$(if $(LOAD_DRV_DEB), $($(1)_CACHE_USER) tar -C $($(1)_BASE_PATH) -mxzvf $(CACHE_FILE_SELECT) 1>> $($(1)_DST_PATH)/$(1).log ,echo );
++		echo "File $(CACHE_FILE_SELECT) is loaded from cache" >> $($(1)_DST_PATH)/$(1).log
++		$(eval $(1)_CACHE_LOADED := Yes)
++		$(shell touch $(CACHE_FILE_SELECT))
++		echo "[ CACHE::LOADED ] $($(1)_CACHE_DIR)/$($(1)_MOD_CACHE_FILE)" >> $($(1)_DST_PATH)/$(1).log
++		,
++		echo "File $($(1)_CACHE_DIR)/$($(1)_MOD_CACHE_FILE)  is not present in cache or cache mode set as $(SONIC_DPKG_CACHE_METHOD) !" >> $($(1)_DST_PATH)/$(1).log
++		echo "[ CACHE::SKIPPED ] $($(1)_CACHE_DIR)/$($(1)_MOD_CACHE_FILE)" >> $($(1)_DST_PATH)/$(1).log
++		echo "[ CACHE::SKIPPED ] DEP_FILES - Modified Files: [$($(1)_FILES_MODIFIED)] " >> $($(1)_DST_PATH)/$(1).log
++		echo "[ CACHE::SKIPPED ] DEPENDS   - Modified Files: [$?] " >> $($(1)_DST_PATH)/$(1).log
++	 )
++endef
++
++# Saves the deb package into debian cache
++# A single tared-zip cache is created for .deb and its derived packages in the cache direcory.
++# It saves the .deb into global cache only when its dependencies are not changed,
++#    Otherwise it saves the .deb into local cache
++# The cache save is protected with lock.
++# Args:
++# $(1) => target name
++# $(2) => target output file name
++define SAVE_INTO_CACHE
++
++	# Calculate the modules SHA and its dependency SHA value
++	$(call GET_MOD_DEP_SHA,$(1))
++	$(call GET_MOD_SHA,$(1))
++
++	# Form the cache file name
++	$(eval $(1)_MOD_CACHE_FILE  := $(1)-$($(1)_DEP_MOD_SHA)-$($(1)_MOD_HASH).tgz)
++	$(if $(MDEBUG), $(info $(1)_MOD_CACHE_FILE := $($(1)_MOD_CACHE_FILE)))
++
++	# Retrive and log files list that are modified for the target.
++	$(call GET_MODIFIED_FILES,$(1))
++
++	$(eval MOD_CACHE_FILE=$($(1)_MOD_CACHE_FILE))
++	$(call MOD_LOCK,$(1),$(SONIC_DPKG_CACHE_DIR),$(MOD_CACHE_LOCK_SUFFIX),$(MOD_CACHE_LOCK_TIMEOUT))
++	$(if $($(1)_FILES_MODIFIED),
++		echo "Target $(1) dependencies are modifed - global save cache skipped" >> $($(1)_DST_PATH)/$(1).log
++		$(eval $(1)_CACHE_DIR := $(SONIC_DPKG_LOCAL_CACHE_DIR))
++	 )
++	$($(1)_CACHE_USER) tar -C $($(1)_BASE_PATH) -mczvf $($(1)_CACHE_DIR)/$(MOD_CACHE_FILE) $(2) $(addprefix $($(1)_DST_PATH)/,$($(1)_DERIVED_DEBS) $($(1)_EXTRA_DEBS) )  \
++		1>>$($(1)_DST_PATH)/$(1).log
++	sudo chmod 777 $($(1)_CACHE_DIR)/$(MOD_CACHE_FILE)
++
++	echo "File $($(1)_CACHE_DIR)/$(MOD_CACHE_FILE) saved in cache " >> $($(1)_DST_PATH)/$(1).log
++	echo "[ CACHE::SAVED ] $($(1)_CACHE_DIR)/$(MOD_CACHE_FILE)" >> $($(1)_DST_PATH)/$(1).log
++
++	$(call MOD_UNLOCK,$(1))
++endef
++
++# Read from the cache
++RCACHE_OPTIONS := cache rcache rwcache
++define CHECK_RCACHE_ENABLED
++$(if $(and $(filter $(RCACHE_OPTIONS),$(SONIC_DPKG_CACHE_METHOD)),$(filter-out none,$($(1)_CACHE_MODE))),enabled)
++endef
++
++# Write into the cache
++WCACHE_OPTIONS := cache wcache rwcache
++define CHECK_WCACHE_ENABLED
++$(if $(and $(filter $(WCACHE_OPTIONS),$(SONIC_DPKG_CACHE_METHOD)),$(filter-out none,$($(1)_CACHE_MODE))),enabled)
++endef
++
++# It logs the reason why the target is getting built/rebuilt
++# Args:
++# $(1) => target name
++define SHOW_WHY
++	@echo "[ REASON ] :\
++		$(if $(filter $(PHONY),$@), it is phony,\
++		$(eval $(1)_PREREQ_PHONY:= $(filter $(PHONY),$^))\
++		$(eval $(1)_PREREQ_DNE:= $(filter-out $(wildcard $^) $($(1)_PREREQ_PHONY),$^))\
++		$(eval $(1)_PREREQ_NEW:= $(filter-out $($(1)_PREREQ_DNE),$?))\
++		$(if $(wildcard $@),$(if $($(1)_PREREQ_NEW), NEWER PREREQUISITES: $($(1)_PREREQ_NEW)), $@ does not exist)\
++		$(if $($(1)_PREREQ_DNE),  NON-EXISTENT PREREQUISITES: $($(1)_PREREQ_DNE))\
++		$(if $($(1)_PREREQ_PHONY),  PHONY PREREQUISITES: $($(1)_PREREQ_PHONY)))"  >> $($(1)_DST_PATH)/$(1).log
++
++	@echo "[ FLAGS  FILE    ] : [$($(1)_FILE_FLAGS)] " >> $($(1)_DST_PATH)/$(1).log
++	@echo "[ FLAGS  DEPENDS ] : [$($(1)_DEP_FLAGS)] " >> $($(1)_DST_PATH)/$(1).log
++	@echo "[ FLAGS  DIFF    ] : [$($(1)_FLAGS_DIFF)] " >> $($(1)_DST_PATH)/$(1).log
++	@echo "[ DEP    DEPENDS ] : [$($(1)_DEP_FILES_MODIFIED)] " >> $($(1)_DST_PATH)/$(1).log
++	@echo "[ SMDEP  DEPENDS ] : [$($(1)_SMDEP_FILES_MODIFIED)] " >> $($(1)_DST_PATH)/$(1).log
++	@echo "[ TARGET DEPENDS ] : [$?] " >> $($(1)_DST_PATH)/$(1).log
++endef
++
++
++
++# It invokes the Load Cache macro if cache is enabled globally as well as per module level
++# Args:
++# $(1) => target name
++# $(2) => target output file name
++define LOAD_CACHE
++	$(call SHOW_WHY,$(1))
++	$(if $(call CHECK_RCACHE_ENABLED,$(1)), $(call LOAD_FROM_CACHE,$(1),$(2)) )
++endef
++
++
++# It invokes the Save Cache if cache is enabled globally as well as per module level
++# Args:
++# $(1) => target name
++# $(2) => target output file name
++define SAVE_CACHE
++	$(if $(call CHECK_WCACHE_ENABLED,$(1)), $(call SAVE_INTO_CACHE,$(1),$(2)))
++endef
++
++
++
++# Set the target path for each target.
++$(foreach pkg, $(SONIC_MAKE_DEBS) $(SONIC_DPKG_DEBS) $(SONIC_ONLINE_DEBS) $(SONIC_COPY_DEBS), \
++        $(eval $(pkg)_DST_PATH := $(if $($(pkg)_DST_PATH), $($(pkg)_DST_PATH), $(DEBS_PATH))) \
++		$(eval $(DEBS_PATH)/$(pkg)_TARGET := $(pkg)) )
++
++$(foreach pkg, $(SONIC_MAKE_FILES), \
++        $(eval $(pkg)_DST_PATH := $(if $($(pkg)_DST_PATH), $($(pkg)_DST_PATH), $(FILES_PATH))) \
++		$(eval $(FILES_PATH)/$(pkg)_TARGET := $(pkg)) )
++
++$(foreach pkg, $(SONIC_PYTHON_STDEB_DEBS), \
++        $(eval $(pkg)_DST_PATH := $(if $($(pkg)_DST_PATH), $($(pkg)_DST_PATH), $(PYTHON_DEBS_PATH))) \
++		$(eval $(PYTHON_DEBS_PATH)/$(pkg)_TARGET := $(pkg)) )
++
++$(foreach pkg, $(SONIC_PYTHON_WHEELS), \
++        $(eval $(pkg)_DST_PATH := $(if $($(pkg)_DST_PATH), $($(pkg)_DST_PATH), $(PYTHON_WHEELS_PATH))) \
++		$(eval $(PYTHON_WHEELS_PATH)/$(pkg)_TARGET := $(pkg)) )
++
++$(foreach pkg, $(SONIC_DOCKER_IMAGES) $(SONIC_DOCKER_DBG_IMAGES), \
++        $(eval $(pkg)_DST_PATH := $(if $($(pkg)_DST_PATH), $($(pkg)_DST_PATH), $(TARGET_PATH))) \
++		$(eval $(TARGET_PATH)/$(pkg)_TARGET := $(pkg)) )
++
++$(foreach pkg, $(SONIC_INSTALL_PKGS), \
++        $(eval $(pkg)_DST_PATH := $(if $($(pkg)_DST_PATH), $($(pkg)_DST_PATH), $(FSROOT_PATH))) \
++		$(eval $(FSROOT_PATH)/$(pkg)_TARGET := $(pkg)) )
++
++
++# define the DEP files(.dep and .smdep) and SHA files (.sha and smsha) for each target
++$(foreach pkg, $(SONIC_MAKE_DEBS) $(SONIC_DPKG_DEBS) $(SONIC_ONLINE_DEBS) $(SONIC_COPY_DEBS) \
++        $(SONIC_MAKE_FILES) $(SONIC_PYTHON_STDEB_DEBS) $(SONIC_PYTHON_WHEELS) \
++        $(SONIC_DOCKER_IMAGES) $(SONIC_DOCKER_DBG_IMAGES) $(SONIC_INSTALL_PKGS), \
++        $(eval $(pkg)_MOD_SRC_PATH:=$(if $($(pkg)_SRC_PATH),$($(pkg)_SRC_PATH),$($(pkg)_PATH))) \
++        $(eval $(pkg)_BASE_PATH:=$(if $($(pkg)_BASE_PATH),$($(pkg)_BASE_PATH),$(CURDIR))) \
++        $(eval $(pkg)_DEP_FLAGS_FILE:=$($(pkg)_DST_PATH)/$(pkg).flags) \
++        $(eval $(pkg)_MOD_DEP_FILE:=$($(pkg)_DST_PATH)/$(pkg).dep) \
++        $(eval $(pkg)_MOD_HASH_FILE:=$($(pkg)_DST_PATH)/$(pkg).dep.sha) \
++        $(eval $(pkg)_SMOD_DEP_FILE:=$(if $($(pkg)_SMDEP_FILES),$($(pkg)_DST_PATH)/$(pkg).smdep)) \
++        $(eval $(pkg)_SMOD_HASH_FILE:=$(if $($(pkg)_SMDEP_FILES),$($(pkg)_DST_PATH)/$(pkg).smdep.smsha)) \
++        $(eval $(pkg)_DEP_FILES_LIST := $($(pkg)_DEP_FLAGS_FILE) $($(pkg)_DEP_FILES) $($(pkg)_SMDEP_FILES)) \
++        $(eval $(pkg)_CACHE_DIR := $(SONIC_DPKG_CACHE_DIR)) \
++        $(if $(filter-out none,$(SONIC_DPKG_CACHE_METHOD)), \
++			$(if $(filter-out none,$($(pkg)_CACHE_MODE)), \
++				$(if $($(pkg)_SMDEP_FILES), \
++					$(if $($(pkg)_SMDEP_PATHS),,$(info Missing PATH/SRC_PATH attribute for $(pkg) package)) \
++				 ),\
++				$(info [ DPKG ] Cache is not enabled for $(pkg) package)\
++			 )\
++		 ) \
++    )
++
++
++# DPGK framework creates three dependency files for each target.
++#         1. Flags file (.flags)
++#         2. Dependency file (.dep),
++#         3. Dependecy SHA hash file (.sha)
++#         4. If the target is a submodule, corresponding dependency file and hash file are created
++#             sub module dependency file (.smdep)
++#             sub module hash file (.smsha)
++#         For example: following are the cache framework files for bash module
++#             target/debs/stretch/bash_4.3-14_amd64.deb             => Final debian package
++#             target/debs/stretch/bash_4.3-14_amd64.deb.flags       => Environment Flag file
++#             target/debs/stretch/bash_4.3-14_amd64.deb.dep         => Dependency files list
++#             target/debs/stretch/bash_4.3-14_amd64.deb.dep.sha     => SHA Hash file
++#
++#
++# [1] .flags => contains value of all the environment variables of a target.
++#                 Each target can have dependency with one or more environment variable.
++#                 For example:
++#                     SONIC_DEBUGGING_ON=y
++#                     SONIC_PROFILING_ON=y
++#                     SONIC_SANITIZER_ON=y
++#                     etc
++#                 If any of the ENV flag variables are modified, the target needs to be rebuilt as
++#                 the content of flag file is changed becase of value of ENV variable is changed.
++#
++# [2] .dep => contains the dependency files list for a target. Eeach traget can have one or more dependency files.
++#                 If any of the ENV flag variables are modified, the target needs to be rebuilt.
++#                 For example: Dependency files list for 'bash' module
++#                     rules/bash.mk
++#                     rules/bash.dep
++#                     src/bash/Makefile
++#                     etc
++#
++# [3] .sha => contains the 48 byte SHA value for each dependency file present in the .dep file.
++#                 For example:
++#                     9604676527653dcf7b6046fdda7ba52026b7f56f   rules/bash.mk
++#                     191c345c1270776b3902c9ec91d5e777e0b5e2a3   rules/bash.dep
++#                     55692fe59303554b5958b04aa62c3651bc34bb6a   src/bash/Makefile
++#                     etc
++#
++# If module target is a sub module in the sonic repo, the following additional files gets created for that target.
++#         .smdep  => contains the dependency files list
++#         .smsha  => contains the SHA hash value for .smdep files list.
++
++
++
++
++
++# ruiles for <.flags> file creation
++#
++# Each target defines a variable called '_DEP_FLAGS' that contais  a list of environment flags for that target and
++# that indicates that target needs to be rebuilt if any of the dependent flags are changed.
++# An environmental dependency flags file is created with the name as ‘<target name>.flags’  for each target.
++# This file contains the values of target environment flags and gets updated only when there is a change in the flag's value.
++# This file is added as a dependency to the target, so that any change in the file will trigger the target recompilation.
++# For Eg:
++#       target/debs/stretch/linux-headers-4.9.0-9-2-common_4.9.168-1+deb9u3_all.deb.flags
++#
++#  RULE args:
++#  $(1)  => target name
++#  $(2)  => target destination folder path
++#  $(3)  => target file extension
++#
++#  It updates the _DEP_FLAGS variable if there is any change in the module flags.
++
++define FLAGS_DEP_RULES
++ALL_DEP_FILES_LIST += $(foreach pkg,$(2), $(if $(filter none,$($(1)_CACHE_MODE)),$(addsuffix .$(3),$(addprefix $(pkg)/, $(1)))))
++$(addsuffix .$(3),$(addprefix $(2)/, $(1))) :: $(2)/%.$(3) :
++	@$$(eval $$*_FILE_FLAGS := $$(shell test -f $$@ && cat $$@)) 
++	@echo '$$($$*_DEP_FLAGS)' | cmp -s - $$@ || echo '$$($$*_DEP_FLAGS)' > $$@
++	$$(eval $$*_FLAGS_DIFF := $$(filter-out $$($$*_FILE_FLAGS),$$($$*_DEP_FLAGS)) $$(filter-out $$($$*_DEP_FLAGS),$$($$*_FILE_FLAGS)))
++	@$$(if $$(MDEBUG), $$(info FLAGS: $$@, DEP:$$?))
++endef
++$(eval $(call FLAGS_DEP_RULES, $(SONIC_MAKE_DEBS) $(SONIC_DPKG_DEBS) $(SONIC_ONLINE_DEBS) $(SONIC_COPY_DEBS), $(DEBS_PATH),flags) )
++$(eval $(call FLAGS_DEP_RULES, $(SONIC_MAKE_FILES), $(FILES_PATH),flags))
++$(eval $(call FLAGS_DEP_RULES, $(SONIC_PYTHON_STDEB_DEBS), $(PYTHON_DEBS_PATH),flags))
++$(eval $(call FLAGS_DEP_RULES, $(SONIC_PYTHON_WHEELS), $(PYTHON_WHEELS_PATH),flags))
++$(eval $(call FLAGS_DEP_RULES, $(SONIC_DOCKER_IMAGES) $(SONIC_DOCKER_DBG_IMAGES), $(TARGET_PATH),flags))
++$(eval $(call FLAGS_DEP_RULES, $(SONIC_INSTALL_PKGS), $(FSROOT_PATH),flags))
++
++
++
++
++# rules for <.smdep> and <.smsha> file creation
++# This rule creates two dependency files for a target  if the target is a submodule
++#     [1] .smdep file
++#         Each module target defines a variable called '_SMDEP_FILES' that contains the list of sub module dependency files for the target.
++#        Contents of the '_SMDEP_FILES' variable is stored in this file
++#
++#     [2] .smsha file
++#         The SHA hash (.smsha) file is created from 48 byte SHA value for each of the dependency files present in the .smdep file
++#
++# The target needs to be rebuilt if any of the dependent flags are changed.
++# The submodule dependency file is created with the name as '<target name>.smdep' and the SHA hash file created as '<target name>.smdep.smsha'.
++# This file is added as a dependency to the target, so that any change in the file will trigger the target recompilation.
++# For Eg:
++#       target/debs/stretch/linux-headers-4.9.0-9-2-common_4.9.168-1+deb9u3_all.deb.smdep
++#       target/debs/stretch/linux-headers-4.9.0-9-2-common_4.9.168-1+deb9u3_all.deb.smdep.smsha
++#
++#  RULE args:
++#  $(1)  => target name
++#  $(2)  => target destination folder path
++#  $(3)  => target file extension
++
++define SMSHA_DEP_RULES
++ALL_DEP_FILES_LIST += $(foreach pkg,$(2), $($(filter none,$($(1)_CACHE_MODE)), \
++                      $(addsuffix .$(3),$(addprefix $(pkg)/, $(1))) \
++                      $(addsuffix .$(3).smsha,$(addprefix $(pkg)/, $(1)))))
++$(addsuffix .$(3),$(addprefix $(2)/, $(1))) : $(2)/%.$(3) : \
++	$(2)/%.flags   $$$$($$$$*_SMDEP_FILES)
++	@$$(eval $$*_SMDEP_FILES_MODIFIED := $$? )
++	@$$(file >$$@,$$(patsubst $$($$*_MOD_SRC_PATH)/%,%,$$($$*_SMDEP_FILES)))
++	@( cd $$($$*_MOD_SRC_PATH) ; cat $$($$*_BASE_PATH)/$$@  |xargs git hash-object ) >$$@.smsha
++	@$$(if $$(MDEBUG), $$(info SMDEP:$$@, MOD:$$?))
++endef
++$(eval $(call SMSHA_DEP_RULES, $(SONIC_MAKE_DEBS) $(SONIC_DPKG_DEBS) $(SONIC_ONLINE_DEBS) $(SONIC_COPY_DEBS), $(DEBS_PATH),smdep))
++$(eval $(call SMSHA_DEP_RULES, $(SONIC_MAKE_FILES), $(FILES_PATH),smdep))
++$(eval $(call SMSHA_DEP_RULES, $(SONIC_PYTHON_STDEB_DEBS), $(PYTHON_DEBS_PATH),smdep))
++$(eval $(call SMSHA_DEP_RULES, $(SONIC_PYTHON_WHEELS), $(PYTHON_WHEELS_PATH),smdep))
++$(eval $(call SMSHA_DEP_RULES, $(SONIC_DOCKER_IMAGES) $(SONIC_DOCKER_DBG_IMAGES), $(TARGET_PATH),smdep))
++
++
++
++
++
++# rules for <.dep> and <.sha> file creation
++#
++# This rule creates two dependency files for the target
++#     [1] .dep file
++#         Each module target defines a variable called '_DEP_FILES' that contains the list of dependency files for the target.
++#        Contents of the '_DEP_FILES' variable is stored in this file
++#
++#     [2] .sha file
++#         The SHA hash (.sha) file is created from 48 byte SHA value for each of the dependency files present in the .dep file
++#
++# The target needs to be rebuilt if any of the dependent flags are changed.
++# The module dependency file is created with the name as '<target name>.dep' and the SHA hash file created as '<target name>.dep.sha'.
++# This file is added as a dependency to the target, so that any change in the file will trigger the target recompilation.
++# For Eg:
++#       target/debs/stretch/bash_4.3-14_amd64.deb.dep
++#       target/debs/stretch/bash_4.3-14_amd64.deb.dep.sha
++#
++#  RULE args:
++#          $(1)  => target name
++#          $(2)  => target destination folder path
++#          $(3)  => target file extension
++#
++
++define SHA_DEP_RULES
++ALL_DEP_FILES_LIST += $(foreach pkg,$(2), $($(filter none,$($(1)_CACHE_MODE)), \
++                      $(addsuffix .$(3),$(addprefix $(pkg)/, $(1))) \
++                      $(addsuffix .$(3).sha,$(addprefix $(pkg)/, $(1)))))
++$(addsuffix .$(3),$(addprefix $(2)/, $(1))) : $(2)/%.$(3) : \
++	$(2)/%.flags $$$$($$$$*_DEP_FILES) $$$$(if $$$$($$$$*_SMDEP_FILES), $(2)/%.smdep)
++	@$$(eval $$*_DEP_FILES_MODIFIED := $$? )
++	@$$(file >$$@,$$($$*_DEP_FILES))
++	@cat $$@ |xargs git hash-object >$$@.sha
++	@$$(if $$(MDEBUG), $$(info DEP: $$@, MOD:$$?))
++endef
++$(eval $(call SHA_DEP_RULES, $(SONIC_MAKE_DEBS) $(SONIC_DPKG_DEBS) $(SONIC_ONLINE_DEBS) $(SONIC_COPY_DEBS), $(DEBS_PATH),dep))
++$(eval $(call SHA_DEP_RULES, $(SONIC_MAKE_FILES), $(FILES_PATH),dep))
++$(eval $(call SHA_DEP_RULES, $(SONIC_PYTHON_STDEB_DEBS), $(PYTHON_DEBS_PATH),dep))
++$(eval $(call SHA_DEP_RULES, $(SONIC_PYTHON_WHEELS), $(PYTHON_WHEELS_PATH),dep))
++$(eval $(call SHA_DEP_RULES, $(SONIC_DOCKER_IMAGES) $(SONIC_DOCKER_DBG_IMAGES), $(TARGET_PATH),dep))
++$(eval $(call SHA_DEP_RULES, $(SONIC_INSTALL_PKGS), $(FSROOT_PATH),dep))
++
++
++
++
++
++# Clean all the DEP and SHA files for all the DEBS target
++SONIC_CACHE_CLEAN_DEBS = $(addsuffix -clean,$(addprefix $(DEBS_PATH)/, \
++           $(SONIC_ONLINE_DEBS) \
++           $(SONIC_COPY_DEBS) \
++           $(SONIC_MAKE_DEBS) \
++           $(SONIC_DPKG_DEBS) \
++           $(SONIC_DERIVED_DEBS) \
++           $(SONIC_EXTRA_DEBS)))
++$(SONIC_CACHE_CLEAN_DEBS) :: $(DEBS_PATH)/%-clean : .platform $$(addsuffix -clean,$$(addprefix $(DEBS_PATH)/,$$($$*_MAIN_DEB))) 
++	@rm -f $($*_DEP_FLAGS_FILE) $($*_MOD_HASH_FILE) $($*_SMOD_HASH_FILE) \
++        $($*_MOD_DEP_FILE) $($*_SMOD_DEP_FILE)
++
++
++# Clean all the DEP and SHA files for all the FILES target
++SONIC_CACHE_CLEAN_FILES = $(addsuffix -clean,$(addprefix $(FILES_PATH)/, \
++           $(SONIC_ONLINE_FILES) \
++           $(SONIC_COPY_FILES) \
++           $(SONIC_MAKE_FILES)))
++$(SONIC_CACHE_CLEAN_FILES) :: $(FILES_PATH)/%-clean : .platform 
++	@rm -f $($*_DEP_FLAGS_FILE) $($*_MOD_HASH_FILE) $($*_SMOD_HASH_FILE) \
++        $($*_MOD_DEP_FILE) $($*_SMOD_DEP_FILE)
++
++
++# Clean all the DEP and SHA files for all the DOCKER target
++SONIC_CACHE_CLEAN_TARGETS = $(addsuffix -clean,$(addprefix $(TARGET_PATH)/, \
++               $(SONIC_DOCKER_IMAGES) \
++               $(SONIC_DOCKER_DBG_IMAGES) \
++               $(SONIC_SIMPLE_DOCKER_IMAGES) \
++               $(SONIC_INSTALLERS)))
++$(SONIC_CACHE_CLEAN_TARGETS) :: $(TARGET_PATH)/%-clean : .platform 
++	@rm -f $($*_DEP_FLAGS_FILE) $($*_MOD_HASH_FILE) $($*_SMOD_HASH_FILE) \
++        $($*_MOD_DEP_FILE) $($*_SMOD_DEP_FILE)
++
++
++# Clean all the DEP and SHA files for all the PYTHON DEBS target
++SONIC_CACHE_CLEAN_STDEB_DEBS = $(addsuffix -clean,$(addprefix $(PYTHON_DEBS_PATH)/, \
++             $(SONIC_PYTHON_STDEB_DEBS)))
++$(SONIC_CACHE_CLEAN_STDEB_DEBS) :: $(PYTHON_DEBS_PATH)/%-clean : .platform 
++	@rm -f $($*_DEP_FLAGS_FILE) $($*_MOD_HASH_FILE) $($*_SMOD_HASH_FILE) \
++        $($*_MOD_DEP_FILE) $($*_SMOD_DEP_FILE)
++
++
++# Clean all the DEP and SHA files for all the PYTHON WHEELS target
++SONIC_CACHE_CLEAN_WHEELS = $(addsuffix -clean,$(addprefix $(PYTHON_WHEELS_PATH)/, \
++             $(SONIC_PYTHON_WHEELS)))
++$(SONIC_CACHE_CLEAN_WHEELS) :: $(PYTHON_WHEELS_PATH)/%-clean : .platform 
++	@rm -f $($*_DEP_FLAGS_FILE) $($*_MOD_HASH_FILE) $($*_SMOD_HASH_FILE) \
++        $($*_MOD_DEP_FILE) $($*_SMOD_DEP_FILE)
++
++.PHONY: cclean
++cclean:: $(SONIC_CACHE_CLEAN_DEBS) $(SONIC_CACHE_CLEAN_FILES) $(SONIC_CACHE_CLEAN_TARGETS) \
++        $(SONIC_CACHE_CLEAN_STDEB_DEBS) $(SONIC_CACHE_CLEAN_WHEELS)
++
++.PHONY: clean 
++clean:: cclean
++
++# Clear all the local cache contents
++.PHONY:lcclean
++lcclean::
++	@rm -f $(TARGET_PATH)/cache/*
++
++
++
++# List all main targets and its derived target with indent.
++listall :
++	@$(foreach target,$(SONIC_TARGET_LIST),\
++        $(eval DPKG:=$(lastword $(subst /, ,$(target)))) \
++        $(eval PATH:= $(subst $(DPKG),,$(target))) \
++        $(if $($(DPKG)_MAIN_DEB),,
++			echo "[$(target)] "; \
++            $(foreach pkg,$($(DPKG)_DERIVED_DEBS) $($(DPKG)_EXTRA_DEBS),\
++				echo "     $(PATH)$(pkg)"; \
++             )\
++         )\
++      )
++
++#$(addprefix show-,$(SONIC_TARGET_LIST)):show-%:
++show-%:
++	@$(foreach target,$(SONIC_TARGET_LIST),\
++        $(eval DPKG:=$(lastword $(subst /, ,$(target)))) \
++        $(eval PATH:= $(subst $(DPKG),,$(target))) \
++        $(if $(findstring $*,$(target)),
++		$(info ) \
++		$(eval MDPKG:=$(if $($(DPKG)_MAIN_DEB),$($(DPKG)_MAIN_DEB),$(DPKG))) \
++			$(info  [$(PATH)$(MDPKG)]  ) \
++            $(foreach pkg,$($(MDPKG)_DERIVED_DEBS) $($(MDPKG)_EXTRA_DEBS),\
++				$(info $(SPACE)$(SPACE)$(SPACE)$(SPACE) $(PATH)$(pkg)) \
++             )\
++         )\
++      )
++	$(info ) 
++
++
++
++# Cache prune - Remove least frequently used cache files.
++NUMDAYS ?= 7 # Delete all the cache files which are not used within last 7 days
++.PHONY: cprune
++cprune:
++	@find $(SONIC_DPKG_CACHE_DIR) -name "*.tgz" !  -mtime -$(NUMDAYS) -exec rm -f {} \;
++
++
++
++# Invoke DPKG dependency only if DPKG cache is enabled.
++define dpkg_depend
++	$(if $(filter-out none,$(SONIC_DPKG_CACHE_METHOD)),$(1))
++endef
+diff --git a/Makefile.work b/Makefile.work
+index 45b58af..0af56b3 100644
+--- a/Makefile.work
++++ b/Makefile.work
+@@ -32,6 +32,8 @@
+ #  *                 Default: yes
+ #  *                 Values:  yes, no
+ #  * KERNEL_PROCURE_METHOD: Specifying method of obtaining kernel Debian package: download or build
++#  * SONIC_DPKG_CACHE_METHOD: Specifying method of obtaining the Debian packages from cache: none or cache
++#  * SONIC_DPKG_CACHE_SOURCE: Debian package cache location when cache enabled for debian packages
+ #
+ ###############################################################################
+ 
+@@ -107,6 +109,10 @@ DOCKER_RUN := docker run --rm=true --privileged \
+ 
+ include rules/config
+ 
++ifneq ($(SONIC_DPKG_CACHE_SOURCE),)
++	DOCKER_RUN += -v "$(SONIC_DPKG_CACHE_SOURCE):/dpkg_cache:rw"
++endif
++
+ ifeq ($(SONIC_CONFIG_USE_NATIVE_DOCKERD_FOR_BUILD), y)
+     DOCKER_RUN += -v /var/run/docker.sock:/var/run/docker.sock
+ endif
+@@ -175,12 +181,15 @@ SONIC_BUILD_INSTRUCTION :=  make \
+                            SONIC_ENABLE_PFCWD_ON_START=$(ENABLE_PFCWD_ON_START) \
+                            SONIC_ENABLE_SYNCD_RPC=$(ENABLE_SYNCD_RPC) \
+                            SONIC_INSTALL_DEBUG_TOOLS=$(INSTALL_DEBUG_TOOLS) \
++                           MDEBUG=$(MDEBUG) \
+                            PASSWORD=$(PASSWORD) \
+                            USERNAME=$(USERNAME) \
+                            SONIC_BUILD_JOBS=$(SONIC_BUILD_JOBS) \
+                            SONIC_USE_DOCKER_BUILDKIT=$(SONIC_USE_DOCKER_BUILDKIT) \
+                            VS_PREPARE_MEM=$(VS_PREPARE_MEM) \
+                            KERNEL_PROCURE_METHOD=$(KERNEL_PROCURE_METHOD) \
++                           SONIC_DPKG_CACHE_METHOD=$(SONIC_DPKG_CACHE_METHOD) \
++                           SONIC_DPKG_CACHE_SOURCE=$(SONIC_DPKG_CACHE_SOURCE) \
+                            HTTP_PROXY=$(http_proxy) \
+                            HTTPS_PROXY=$(https_proxy) \
+                            SONIC_ENABLE_SYSTEM_TELEMETRY=$(ENABLE_SYSTEM_TELEMETRY) \
+diff --git a/platform/broadcom/docker-ptf-brcm.dep b/platform/broadcom/docker-ptf-brcm.dep
+new file mode 100644
+index 0000000..b899d05
+--- /dev/null
++++ b/platform/broadcom/docker-ptf-brcm.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_PTF_BRCM)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/docker-ptf-brcm.mk platform/broadcom/docker-ptf-brcm.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_PTF_BRCM)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_PTF_BRCM)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_PTF_BRCM)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/docker-saiserver-brcm.dep b/platform/broadcom/docker-saiserver-brcm.dep
+new file mode 100644
+index 0000000..7d18f08
+--- /dev/null
++++ b/platform/broadcom/docker-saiserver-brcm.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_SAISERVER_BRCM)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/docker-saiserver-brcm.mk platform/broadcom/docker-saiserver-brcm.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SAISERVER_BRCM)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SAISERVER_BRCM)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SAISERVER_BRCM)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/docker-syncd-brcm-rpc.dep b/platform/broadcom/docker-syncd-brcm-rpc.dep
+new file mode 100644
+index 0000000..4427b0a
+--- /dev/null
++++ b/platform/broadcom/docker-syncd-brcm-rpc.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_SYNCD_BRCM_RPC)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) $(PLATFORM_PATH)/docker-syncd-brcm-rpc.mk $(PLATFORM_PATH)/docker-syncd-brcm-rpc.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SYNCD_BRCM_RPC)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SYNCD_BRCM_RPC)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SYNCD_BRCM_RPC)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/docker-syncd-brcm.dep b/platform/broadcom/docker-syncd-brcm.dep
+new file mode 100644
+index 0000000..48fa57f
+--- /dev/null
++++ b/platform/broadcom/docker-syncd-brcm.dep
+@@ -0,0 +1,11 @@
++#DPKG FRK
++DPATH       := $($(DOCKER_SYNCD_BASE)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/docker-syncd-brcm.mk platform/broadcom/docker-syncd-brcm.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SYNCD_BASE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SYNCD_BASE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SYNCD_BASE)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_SYNCD_BASE),$(DOCKER_SYNCD_BASE_DBG)))
+diff --git a/platform/broadcom/libsaithrift-dev.dep b/platform/broadcom/libsaithrift-dev.dep
+new file mode 100644
+index 0000000..2ae0106
+--- /dev/null
++++ b/platform/broadcom/libsaithrift-dev.dep
+@@ -0,0 +1,13 @@
++#DPKG FRK
++SPATH       := $($(LIBSAITHRIFT_DEV)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/libsaithrift-dev.mk platform/broadcom/libsaithrift-dev.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_PATHS := $(SPATH)  $(SPATH)/bm/behavioral-model  $(SPATH)/test/ptf  $(SPATH)/test/saithrift/ctypesgen
++$(foreach path, $(SMDEP_PATHS), $(eval $(path) :=$(filter-out $(SMDEP_PATHS),$(addprefix $(path)/, $(shell cd $(path) &&  git ls-files | grep -Ev " " )))))
++
++$(LIBSAITHRIFT_DEV)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBSAITHRIFT_DEV)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBSAITHRIFT_DEV)_DEP_FILES   := $(DEP_FILES)
++$(LIBSAITHRIFT_DEV)_SMDEP_FILES := $(foreach path, $(SMDEP_PATHS), $($(path)))
++$(LIBSAITHRIFT_DEV)_SMDEP_PATHS := $(SMDEP_PATHS)
++
+diff --git a/platform/broadcom/one-aboot.dep b/platform/broadcom/one-aboot.dep
+new file mode 100644
+index 0000000..a3b49ce
+--- /dev/null
++++ b/platform/broadcom/one-aboot.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(SONIC_ONE_ABOOT_IMAGE)_CACHE_MODE  := none
+diff --git a/platform/broadcom/one-image.dep b/platform/broadcom/one-image.dep
+new file mode 100644
+index 0000000..c5399d8
+--- /dev/null
++++ b/platform/broadcom/one-image.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(SONIC_ONE_IMAGE)_CACHE_MODE  := none
+diff --git a/platform/broadcom/one-pde-image.dep b/platform/broadcom/one-pde-image.dep
+new file mode 100644
+index 0000000..2abc8ca
+--- /dev/null
++++ b/platform/broadcom/one-pde-image.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(SONIC_ONE_PDE_IMAGE)_CACHE_MODE  := none
+diff --git a/platform/broadcom/platform-modules-accton.dep b/platform/broadcom/platform-modules-accton.dep
+new file mode 100644
+index 0000000..1ca57ec
+--- /dev/null
++++ b/platform/broadcom/platform-modules-accton.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(ACCTON_AS7712_32X_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-accton.mk platform/broadcom/platform-modules-accton.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(ACCTON_AS7712_32X_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(ACCTON_AS7712_32X_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(ACCTON_AS7712_32X_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-alphanetworks.dep b/platform/broadcom/platform-modules-alphanetworks.dep
+new file mode 100644
+index 0000000..6538525
+--- /dev/null
++++ b/platform/broadcom/platform-modules-alphanetworks.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(ALPHANETWORKS_SNH60A0_320FV2_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-alphanetworks.mk platform/broadcom/platform-modules-alphanetworks.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(ALPHANETWORKS_SNH60A0_320FV2_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(ALPHANETWORKS_SNH60A0_320FV2_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(ALPHANETWORKS_SNH60A0_320FV2_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-arista.dep b/platform/broadcom/platform-modules-arista.dep
+new file mode 100644
+index 0000000..c42d529
+--- /dev/null
++++ b/platform/broadcom/platform-modules-arista.dep
+@@ -0,0 +1,13 @@
++
++MPATH       := $($(ARISTA_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-arista.mk platform/broadcom/platform-modules-arista.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(MPATH)/,$(shell cd $(MPATH) && git ls-files))
++
++
++$(ARISTA_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(ARISTA_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(ARISTA_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++$(ARISTA_PLATFORM_MODULE)_SMDEP_FILES := $(SMDEP_FILES)
++$(ARISTA_PLATFORM_MODULE)_SMDEP_PATHS := $(MPATH)
++
+diff --git a/platform/broadcom/platform-modules-brcm-xlr-gts.dep b/platform/broadcom/platform-modules-brcm-xlr-gts.dep
+new file mode 100644
+index 0000000..09e81d7
+--- /dev/null
++++ b/platform/broadcom/platform-modules-brcm-xlr-gts.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(BRCM_XLR_GTS_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-brcm-xlr-gts.mk platform/broadcom/platform-modules-brcm-xlr-gts.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(BRCM_XLR_GTS_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(BRCM_XLR_GTS_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(BRCM_XLR_GTS_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-cel.dep b/platform/broadcom/platform-modules-cel.dep
+new file mode 100644
+index 0000000..f49d8ef
+--- /dev/null
++++ b/platform/broadcom/platform-modules-cel.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(CEL_DX010_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-cel.mk platform/broadcom/platform-modules-cel.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(CEL_DX010_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(CEL_DX010_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(CEL_DX010_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-dell.dep b/platform/broadcom/platform-modules-dell.dep
+new file mode 100644
+index 0000000..32f5d39
+--- /dev/null
++++ b/platform/broadcom/platform-modules-dell.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(DELL_Z9100_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-dell.mk platform/broadcom/platform-modules-dell.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(DELL_Z9100_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DELL_Z9100_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DELL_Z9100_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-delta.dep b/platform/broadcom/platform-modules-delta.dep
+new file mode 100644
+index 0000000..d6d25ae
+--- /dev/null
++++ b/platform/broadcom/platform-modules-delta.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(DELTA_AG9032V1_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-delta.mk platform/broadcom/platform-modules-delta.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(DELTA_AG9032V1_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DELTA_AG9032V1_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DELTA_AG9032V1_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-ingrasys.dep b/platform/broadcom/platform-modules-ingrasys.dep
+new file mode 100644
+index 0000000..5582caf
+--- /dev/null
++++ b/platform/broadcom/platform-modules-ingrasys.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(INGRASYS_S9100_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-ingrasys.mk platform/broadcom/platform-modules-ingrasys.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(INGRASYS_S9100_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(INGRASYS_S9100_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(INGRASYS_S9100_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-inventec.dep b/platform/broadcom/platform-modules-inventec.dep
+new file mode 100644
+index 0000000..1f4003c
+--- /dev/null
++++ b/platform/broadcom/platform-modules-inventec.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(INVENTEC_D7032Q28B_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-inventec.mk platform/broadcom/platform-modules-inventec.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(INVENTEC_D7032Q28B_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(INVENTEC_D7032Q28B_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(INVENTEC_D7032Q28B_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-juniper.dep b/platform/broadcom/platform-modules-juniper.dep
+new file mode 100644
+index 0000000..0301480
+--- /dev/null
++++ b/platform/broadcom/platform-modules-juniper.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(JUNIPER_QFX5210_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-juniper.mk platform/broadcom/platform-modules-juniper.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(JUNIPER_QFX5210_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(JUNIPER_QFX5210_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(JUNIPER_QFX5210_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-mitac.dep b/platform/broadcom/platform-modules-mitac.dep
+new file mode 100644
+index 0000000..cbeeec8
+--- /dev/null
++++ b/platform/broadcom/platform-modules-mitac.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(MITAC_LY1200_32X_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-mitac.mk platform/broadcom/platform-modules-mitac.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(MITAC_LY1200_32X_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(MITAC_LY1200_32X_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(MITAC_LY1200_32X_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-quanta.dep b/platform/broadcom/platform-modules-quanta.dep
+new file mode 100644
+index 0000000..f4167a6
+--- /dev/null
++++ b/platform/broadcom/platform-modules-quanta.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(QUANTA_IX1B_32X_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-quanta.mk platform/broadcom/platform-modules-quanta.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(QUANTA_IX1B_32X_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(QUANTA_IX1B_32X_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(QUANTA_IX1B_32X_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/platform-modules-s6000.dep b/platform/broadcom/platform-modules-s6000.dep
+new file mode 100644
+index 0000000..fff2d52
+--- /dev/null
++++ b/platform/broadcom/platform-modules-s6000.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(DELL_S6000_PLATFORM_MODULE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/platform-modules-s6000.mk platform/broadcom/platform-modules-s6000.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(DELL_S6000_PLATFORM_MODULE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DELL_S6000_PLATFORM_MODULE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DELL_S6000_PLATFORM_MODULE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/raw-image.dep b/platform/broadcom/raw-image.dep
+new file mode 100644
+index 0000000..500ba2a
+--- /dev/null
++++ b/platform/broadcom/raw-image.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(SONIC_RAW_IMAGE)_CACHE_MODE  := none
+diff --git a/platform/broadcom/rules.dep b/platform/broadcom/rules.dep
+new file mode 100644
+index 0000000..d8142ae
+--- /dev/null
++++ b/platform/broadcom/rules.dep
+@@ -0,0 +1,25 @@
++#DPKG FRK
++include $(PLATFORM_PATH)/sai-modules.dep
++include $(PLATFORM_PATH)/sai.dep
++include $(PLATFORM_PATH)/platform-modules-s6000.dep
++include $(PLATFORM_PATH)/platform-modules-dell.dep
++include $(PLATFORM_PATH)/platform-modules-arista.dep
++include $(PLATFORM_PATH)/platform-modules-ingrasys.dep
++include $(PLATFORM_PATH)/platform-modules-accton.dep
++include $(PLATFORM_PATH)/platform-modules-alphanetworks.dep
++include $(PLATFORM_PATH)/platform-modules-inventec.dep
++include $(PLATFORM_PATH)/platform-modules-cel.dep
++include $(PLATFORM_PATH)/platform-modules-delta.dep
++include $(PLATFORM_PATH)/platform-modules-quanta.dep
++#include $(PLATFORM_PATH)/platform-modules-mitac.dep
++include $(PLATFORM_PATH)/platform-modules-juniper.dep
++include $(PLATFORM_PATH)/platform-modules-brcm-xlr-gts.dep
++include $(PLATFORM_PATH)/docker-syncd-brcm.dep
++include $(PLATFORM_PATH)/docker-syncd-brcm-rpc.dep
++include $(PLATFORM_PATH)/docker-saiserver-brcm.dep
++include $(PLATFORM_PATH)/one-image.dep
++include $(PLATFORM_PATH)/one-pde-image.dep
++include $(PLATFORM_PATH)/raw-image.dep
++include $(PLATFORM_PATH)/one-aboot.dep
++include $(PLATFORM_PATH)/libsaithrift-dev.dep
++include $(PLATFORM_PATH)/docker-ptf-brcm.dep
+diff --git a/platform/broadcom/sai-modules.dep b/platform/broadcom/sai-modules.dep
+new file mode 100644
+index 0000000..040a7d7
+--- /dev/null
++++ b/platform/broadcom/sai-modules.dep
+@@ -0,0 +1,10 @@
++
++MPATH       := $($(BRCM_OPENNSL_KERNEL)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/sai-modules.mk platform/broadcom/sai-modules.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(MPATH))
++
++$(BRCM_OPENNSL_KERNEL)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(BRCM_OPENNSL_KERNEL)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(BRCM_OPENNSL_KERNEL)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/sai.dep b/platform/broadcom/sai.dep
+new file mode 100644
+index 0000000..11cc72b
+--- /dev/null
++++ b/platform/broadcom/sai.dep
+@@ -0,0 +1,14 @@
++
++#DPKG FRK
++SPATH       := $($(BRCM_SAI)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/broadcom/sai.mk platform/broadcom/sai.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++
++$(BRCM_SAI)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(BRCM_SAI)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(BRCM_SAI)_DEP_FILES   := $(DEP_FILES)
++
++$(BRCM_SAI_DEV)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(BRCM_SAI_DEV)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(BRCM_SAI_DEV)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/broadcom/sonic-platform-modules-brcm-xlr-gts/debian/files b/platform/broadcom/sonic-platform-modules-brcm-xlr-gts/debian/files
+deleted file mode 100644
+index 5e9df15..0000000
+--- a/platform/broadcom/sonic-platform-modules-brcm-xlr-gts/debian/files
++++ /dev/null
+@@ -1,2 +0,0 @@
+-sonic-platform-brcm-xlr-gts_1.0_amd64.buildinfo main extra
+-sonic-platform-brcm-xlr-gts_1.0_amd64.deb main extra
+diff --git a/platform/broadcom/sonic-platform-modules-juniper/debian/files b/platform/broadcom/sonic-platform-modules-juniper/debian/files
+deleted file mode 100644
+index 24ef0ff..0000000
+--- a/platform/broadcom/sonic-platform-modules-juniper/debian/files
++++ /dev/null
+@@ -1,2 +0,0 @@
+-sonic-juniper-platform-modules_1.1_amd64.buildinfo main extra
+-sonic-platform-juniper-qfx5210_1.1_amd64.deb main extra
+diff --git a/platform/vs/docker-sonic-vs.dep b/platform/vs/docker-sonic-vs.dep
+new file mode 100644
+index 0000000..d544423
+--- /dev/null
++++ b/platform/vs/docker-sonic-vs.dep
+@@ -0,0 +1,10 @@
++#DPKG FRK
++DPATH       := $($(DOCKER_SONIC_VS)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/vs/docker-sonic-vs.mk platform/vs/docker-sonic-vs.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SONIC_VS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SONIC_VS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SONIC_VS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/platform/vs/docker-syncd-vs.dep b/platform/vs/docker-syncd-vs.dep
+new file mode 100644
+index 0000000..e0330f8
+--- /dev/null
++++ b/platform/vs/docker-syncd-vs.dep
+@@ -0,0 +1,11 @@
++#DPKG FRK
++DPATH       := $($(DOCKER_SYNCD_BASE)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/vs/docker-syncd-vs.mk platform/vs/docker-syncd-vs.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SYNCD_BASE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SYNCD_BASE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SYNCD_BASE)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_SYNCD_BASE),$(DOCKER_SYNCD_BASE_DBG)))
+diff --git a/platform/vs/kvm-image.dep b/platform/vs/kvm-image.dep
+new file mode 100644
+index 0000000..05c083a
+--- /dev/null
++++ b/platform/vs/kvm-image.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(SONIC_KVM_IMAGE)_CACHE_MODE  := none
+diff --git a/platform/vs/one-image.dep b/platform/vs/one-image.dep
+new file mode 100644
+index 0000000..c5399d8
+--- /dev/null
++++ b/platform/vs/one-image.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(SONIC_ONE_IMAGE)_CACHE_MODE  := none
+diff --git a/platform/vs/onie.dep b/platform/vs/onie.dep
+new file mode 100644
+index 0000000..36de83c
+--- /dev/null
++++ b/platform/vs/onie.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(ONIE_RECOVERY_IMAGE)_CACHE_MODE  := none
+diff --git a/platform/vs/rules.dep b/platform/vs/rules.dep
+new file mode 100644
+index 0000000..7d36c81
+--- /dev/null
++++ b/platform/vs/rules.dep
+@@ -0,0 +1,8 @@
++include $(PLATFORM_PATH)/syncd-vs.dep
++include $(PLATFORM_PATH)/sonic-version.dep
++include $(PLATFORM_PATH)/docker-sonic-vs.dep
++include $(PLATFORM_PATH)/docker-syncd-vs.dep
++include $(PLATFORM_PATH)/one-image.dep
++include $(PLATFORM_PATH)/onie.dep
++include $(PLATFORM_PATH)/kvm-image.dep
++
+diff --git a/platform/vs/sonic-version.dep b/platform/vs/sonic-version.dep
+new file mode 100644
+index 0000000..1398415
+--- /dev/null
++++ b/platform/vs/sonic-version.dep
+@@ -0,0 +1,2 @@
++#DPKG FRK
++$(SONIC_VERSION)_CACHE_MODE  := none
+diff --git a/platform/vs/syncd-vs.dep b/platform/vs/syncd-vs.dep
+new file mode 100644
+index 0000000..3b0cf00
+--- /dev/null
++++ b/platform/vs/syncd-vs.dep
+@@ -0,0 +1,11 @@
++#DPKG FRK
++DPATH       := $($(SYNCD_VS)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) platform/vs/syncd-vs.mk platform/vs/syncd-vs.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(SYNCD_VS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SYNCD_VS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SYNCD_VS)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(SYNCD_VS),$(SYNCD_VS_DBG)))
+diff --git a/rules/asyncsnmp-py3.dep b/rules/asyncsnmp-py3.dep
+new file mode 100644
+index 0000000..42911cb
+--- /dev/null
++++ b/rules/asyncsnmp-py3.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(ASYNCSNMP_PY3)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/asyncsnmp-py3.mk rules/asyncsnmp-py3.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(ASYNCSNMP_PY3)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(ASYNCSNMP_PY3)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(ASYNCSNMP_PY3)_DEP_FILES   := $(DEP_FILES)
++$(ASYNCSNMP_PY3)_SMDEP_FILES := $(SMDEP_FILES)
++$(ASYNCSNMP_PY3)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/bash.dep b/rules/bash.dep
+new file mode 100644
+index 0000000..9f2758b
+--- /dev/null
++++ b/rules/bash.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(BASH)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/bash.mk rules/bash.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(BASH)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(BASH)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(BASH)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/config b/rules/config
+index 0c2f07c..d0e322f 100644
+--- a/rules/config
++++ b/rules/config
+@@ -96,6 +96,18 @@ DEFAULT_KERNEL_PROCURE_METHOD = build
+ FRR_USER_UID = 300
+ FRR_USER_GID = 300
+ 
++# DPKG cache allows the .deb files to be stored in the cache path. This allows the submodules
++# package to be cached and restored back if its commit hash is not modified and its dependencies are not modified.
++# SONIC_DPKG_CACHE_METHOD - Default method of deb package caching
++#	none    :  no caching
++#	rwcache :  Use cache if exists else build the source and update the cache
++#	wcache  :  Dont use the cache and just build the source and update the cache
++#	rcache  :  Use cache if exists, but dont update the cache
++#	cache   :  Same as rwcache
++# SONIC_DPKG_CACHE_SOURCE - Stores the cache location details
++SONIC_DPKG_CACHE_METHOD ?= none
++SONIC_DPKG_CACHE_SOURCE ?= /var/cache/sonic/artifacts
++
+ # Default VS build memory preparation
+ DEFAULT_VS_PREPARE_MEM = yes
+ 
+diff --git a/rules/dbsyncd-py2.dep b/rules/dbsyncd-py2.dep
+new file mode 100644
+index 0000000..6ca1ab8
+--- /dev/null
++++ b/rules/dbsyncd-py2.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(DBSYNCD_PY2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/dbsyncd-py2.mk rules/dbsyncd-py2.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(DBSYNCD_PY2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DBSYNCD_PY2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DBSYNCD_PY2)_DEP_FILES   := $(DEP_FILES)
++$(DBSYNCD_PY2)_SMDEP_FILES := $(SMDEP_FILES)
++$(DBSYNCD_PY2)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/dhcpmon.dep b/rules/dhcpmon.dep
+new file mode 100644
+index 0000000..cd8a410
+--- /dev/null
++++ b/rules/dhcpmon.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SONIC_DHCPMON)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/dhcpmon.mk rules/dhcpmon.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SONIC_DHCPMON)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_DHCPMON)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_DHCPMON)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-base-stretch.dep b/rules/docker-base-stretch.dep
+new file mode 100644
+index 0000000..dbbdd6b
+--- /dev/null
++++ b/rules/docker-base-stretch.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_BASE_STRETCH)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-base-stretch.mk rules/docker-base-stretch.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_BASE_STRETCH)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_BASE_STRETCH)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_BASE_STRETCH)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-base.dep b/rules/docker-base.dep
+new file mode 100644
+index 0000000..8de00ce
+--- /dev/null
++++ b/rules/docker-base.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_BASE)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-base.mk rules/docker-base.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_BASE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_BASE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_BASE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-config-engine-stretch.dep b/rules/docker-config-engine-stretch.dep
+new file mode 100644
+index 0000000..2562558
+--- /dev/null
++++ b/rules/docker-config-engine-stretch.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_CONFIG_ENGINE_STRETCH)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-config-engine-stretch.mk rules/docker-config-engine-stretch.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_CONFIG_ENGINE_STRETCH)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_CONFIG_ENGINE_STRETCH)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_CONFIG_ENGINE_STRETCH)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-config-engine.dep b/rules/docker-config-engine.dep
+new file mode 100644
+index 0000000..f9cbaa9
+--- /dev/null
++++ b/rules/docker-config-engine.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_CONFIG_ENGINE)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-config-engine.mk rules/docker-config-engine.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_CONFIG_ENGINE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_CONFIG_ENGINE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_CONFIG_ENGINE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-database.dep b/rules/docker-database.dep
+new file mode 100644
+index 0000000..85e807d
+--- /dev/null
++++ b/rules/docker-database.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_DATABASE)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-database.mk rules/docker-database.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_DATABASE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_DATABASE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_DATABASE)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_DATABASE),$(DOCKER_DATABASE_DBG)))
+diff --git a/rules/docker-dhcp-relay.dep b/rules/docker-dhcp-relay.dep
+new file mode 100644
+index 0000000..996e346
+--- /dev/null
++++ b/rules/docker-dhcp-relay.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_DHCP_RELAY)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-dhcp-relay.mk rules/docker-dhcp-relay.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_DHCP_RELAY)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_DHCP_RELAY)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_DHCP_RELAY)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_DHCP_RELAY),$(DOCKER_DHCP_RELAY_DBG)))
+diff --git a/rules/docker-fpm-frr.dep b/rules/docker-fpm-frr.dep
+new file mode 100644
+index 0000000..47deac0
+--- /dev/null
++++ b/rules/docker-fpm-frr.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_FPM_FRR)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-fpm-frr.mk rules/docker-fpm-frr.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_FPM_FRR)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_FPM_FRR)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_FPM_FRR)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_FPM_FRR),$(DOCKER_FPM_FRR_DBG)))
+diff --git a/rules/docker-fpm-gobgp.dep b/rules/docker-fpm-gobgp.dep
+new file mode 100644
+index 0000000..4cbb495
+--- /dev/null
++++ b/rules/docker-fpm-gobgp.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_FPM_GOBGP)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-fpm-gobgp.mk rules/docker-fpm-gobgp.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_FPM_GOBGP)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_FPM_GOBGP)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_FPM_GOBGP)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-fpm-quagga.dep b/rules/docker-fpm-quagga.dep
+new file mode 100644
+index 0000000..987e22b
+--- /dev/null
++++ b/rules/docker-fpm-quagga.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_FPM_QUAGGA)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-fpm-quagga.mk rules/docker-fpm-quagga.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_FPM_QUAGGA)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_FPM_QUAGGA)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_FPM_QUAGGA)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-fpm.dep b/rules/docker-fpm.dep
+new file mode 100644
+index 0000000..126cdbb
+--- /dev/null
++++ b/rules/docker-fpm.dep
+@@ -0,0 +1,11 @@
++#DPKG FRK
++
++DOCKER_FPM := $(filter $(DOCKER_FPM_QUAGGA) $(DOCKER_FPM_FRR) $(DOCKER_FPM_GOBGP), $(SONIC_INSTALL_DOCKER_IMAGES) )
++DPATH       := $($(DOCKER_FPM)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-fpm.mk rules/docker-fpm.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_FPM)_DEP_FILES   += $(DEP_FILES)
++
++
+diff --git a/rules/docker-lldp-sv2.dep b/rules/docker-lldp-sv2.dep
+new file mode 100644
+index 0000000..185d850
+--- /dev/null
++++ b/rules/docker-lldp-sv2.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_LLDP_SV2)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-lldp-sv2.mk rules/docker-lldp-sv2.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_LLDP_SV2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_LLDP_SV2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_LLDP_SV2)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_LLDP_SV2),$(DOCKER_LLDP_SV2_DBG)))
+diff --git a/rules/docker-nat.dep b/rules/docker-nat.dep
+new file mode 100644
+index 0000000..a8f28f2
+--- /dev/null
++++ b/rules/docker-nat.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_NAT)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-nat.mk rules/docker-nat.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_NAT)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_NAT)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_NAT)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_NAT),$(DOCKER_NAT_DBG)))
+diff --git a/rules/docker-orchagent.dep b/rules/docker-orchagent.dep
+new file mode 100644
+index 0000000..7aff4d0
+--- /dev/null
++++ b/rules/docker-orchagent.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_ORCHAGENT)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-orchagent.mk rules/docker-orchagent.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_ORCHAGENT)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_ORCHAGENT)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_ORCHAGENT)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_ORCHAGENT),$(DOCKER_ORCHAGENT_DBG)))
+diff --git a/rules/docker-platform-monitor.dep b/rules/docker-platform-monitor.dep
+new file mode 100644
+index 0000000..7b56d33
+--- /dev/null
++++ b/rules/docker-platform-monitor.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_PLATFORM_MONITOR)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-platform-monitor.mk rules/docker-platform-monitor.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_PLATFORM_MONITOR)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_PLATFORM_MONITOR)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_PLATFORM_MONITOR)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_PLATFORM_MONITOR),$(DOCKER_PLATFORM_MONITOR_DBG)))
+diff --git a/rules/docker-ptf.dep b/rules/docker-ptf.dep
+new file mode 100644
+index 0000000..d62019e
+--- /dev/null
++++ b/rules/docker-ptf.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_PTF)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-ptf.mk rules/docker-ptf.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_PTF)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_PTF)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_PTF)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-router-advertiser.dep b/rules/docker-router-advertiser.dep
+new file mode 100644
+index 0000000..1450462
+--- /dev/null
++++ b/rules/docker-router-advertiser.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_ROUTER_ADVERTISER)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-router-advertiser.mk rules/docker-router-advertiser.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_ROUTER_ADVERTISER)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_ROUTER_ADVERTISER)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_ROUTER_ADVERTISER)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_ROUTER_ADVERTISER),$(DOCKER_ROUTER_ADVERTISER_DBG)))
+diff --git a/rules/docker-sflow.dep b/rules/docker-sflow.dep
+new file mode 100644
+index 0000000..8870549
+--- /dev/null
++++ b/rules/docker-sflow.dep
+@@ -0,0 +1,15 @@
++
++DPATH       := $($(DOCKER_SFLOW)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-sflow.mk rules/docker-sflow.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SFLOW)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SFLOW)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SFLOW)_DEP_FILES   := $(DEP_FILES)
++
++
++#DPKG FRK
++$(eval $(call add_dbg_docker,$(DOCKER_SFLOW),$(DOCKER_SFLOW_DBG)))
++
++
+diff --git a/rules/docker-snmp-sv2.dep b/rules/docker-snmp-sv2.dep
+new file mode 100644
+index 0000000..38d46e1
+--- /dev/null
++++ b/rules/docker-snmp-sv2.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_SNMP_SV2)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-snmp-sv2.mk rules/docker-snmp-sv2.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SNMP_SV2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SNMP_SV2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SNMP_SV2)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_SNMP_SV2),$(DOCKER_SNMP_SV2_DBG)))
+diff --git a/rules/docker-sonic-mgmt-framework.dep b/rules/docker-sonic-mgmt-framework.dep
+new file mode 100644
+index 0000000..05ec104
+--- /dev/null
++++ b/rules/docker-sonic-mgmt-framework.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_MGMT_FRAMEWORK)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-sonic-mgmt-framework.mk rules/docker-sonic-mgmt-framework.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_MGMT_FRAMEWORK)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_MGMT_FRAMEWORK)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_MGMT_FRAMEWORK)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_MGMT_FRAMEWORK),$(DOCKER_MGMT_FRAMEWORK_DBG)))
+diff --git a/rules/docker-sonic-mgmt-spytest.dep b/rules/docker-sonic-mgmt-spytest.dep
+new file mode 100644
+index 0000000..26daffb
+--- /dev/null
++++ b/rules/docker-sonic-mgmt-spytest.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_MGMT_SPYTEST)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-sonic-mgmt-spytest.mk rules/docker-sonic-mgmt-spytest.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_MGMT_SPYTEST)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_MGMT_SPYTEST)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_MGMT_SPYTEST)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_MGMT_SPYTEST),$(DOCKER_MGMT_FRAMEWORK_DBG)))
+diff --git a/rules/docker-sonic-mgmt.dep b/rules/docker-sonic-mgmt.dep
+new file mode 100644
+index 0000000..29e6d39
+--- /dev/null
++++ b/rules/docker-sonic-mgmt.dep
+@@ -0,0 +1,10 @@
++
++DPATH       := $($(DOCKER_SONIC_MGMT)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-sonic-mgmt.mk rules/docker-sonic-mgmt.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_SONIC_MGMT)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_SONIC_MGMT)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_SONIC_MGMT)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/docker-teamd.dep b/rules/docker-teamd.dep
+new file mode 100644
+index 0000000..b58d934
+--- /dev/null
++++ b/rules/docker-teamd.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_TEAMD)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-teamd.mk rules/docker-teamd.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_TEAMD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_TEAMD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_TEAMD)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_TEAMD),$(DOCKER_TEAMD_DBG)))
+diff --git a/rules/docker-telemetry.dep b/rules/docker-telemetry.dep
+new file mode 100644
+index 0000000..7748370
+--- /dev/null
++++ b/rules/docker-telemetry.dep
+@@ -0,0 +1,11 @@
++
++DPATH       := $($(DOCKER_TELEMETRY)_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/docker-telemetry.mk rules/docker-telemetry.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(DPATH))
++
++$(DOCKER_TELEMETRY)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(DOCKER_TELEMETRY)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(DOCKER_TELEMETRY)_DEP_FILES   := $(DEP_FILES)
++
++$(eval $(call add_dbg_docker,$(DOCKER_TELEMETRY),$(DOCKER_TELEMETRY_DBG)))
+diff --git a/rules/frr.dep b/rules/frr.dep
+new file mode 100644
+index 0000000..c6bd41a
+--- /dev/null
++++ b/rules/frr.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(FRR)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/frr.mk rules/frr.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(FRR)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(FRR)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(FRR)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/functions b/rules/functions
+index 93e2a34..5cdd351 100644
+--- a/rules/functions
++++ b/rules/functions
+@@ -91,8 +91,33 @@ $(1)_EXTRA_DEBS += $(2)
+ SONIC_EXTRA_DEBS += $(2)
+ endef
+ 
++
++# call:
++#     add_dbg_docker some_docker.gz, some-docker-dbg.gz
++define add_dbg_docker
++$(2)_PATH = $($(1)_PATH)
++$(2)_DBG_DEPENDS += $($(1)_DBG_DEPENDS)
++$(2)_DBG_IMAGE_PACKAGES += $($(1)_DBG_IMAGE_PACKAGES)
++$(2)_PYTHON_WHEELS += $($(1)_PYTHON_WHEELS)
++$(2)_LOAD_DOCKERS += $($(1)_LOAD_DOCKERS)
++$(2)_CACHE_MODE += $($(1)_CACHE_MODE)
++$(2)_DEP_FLAGS += $($(1)_DEP_FLAGS)
++$(2)_DEP_FILES += $($(1)_DEP_FILES)
++$(2)_SMDEP_FILES += $($(1)_SMDEP_FILES)
++$(2)_SMDEP_PATHS += $($(1)_SMDEP_PATHS)
++$(2)_DEPENDS += $($(1)_DEPENDS)
++$(2)_RDEPENDS += $($(1)_RDEPENDS)
++$(2)_MAIN_DOCKER = $(1)
++$(1)_DBG_DOCKER += $(2)
++SONIC_DBG_DOCKERS += $(2)
++endef
++
++
++
+ ###############################################################################
+ ## Utility functions
+ ###############################################################################
++# Recursive wildcard function
++rwildcard=$(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2) $(filter $(subst *,%,$2),$d))
+ 
+ expand = $(foreach d,$(1),$(call expand,$($(d)_$(2)),$(2))) $(1)
+diff --git a/rules/gobgp.dep b/rules/gobgp.dep
+new file mode 100644
+index 0000000..f7462c6
+--- /dev/null
++++ b/rules/gobgp.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(GOBGP)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/gobgp.mk rules/gobgp.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(GOBGP)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(GOBGP)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(GOBGP)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/hiredis.dep b/rules/hiredis.dep
+new file mode 100644
+index 0000000..93bea54
+--- /dev/null
++++ b/rules/hiredis.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBHIREDIS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/hiredis.mk rules/hiredis.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBHIREDIS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBHIREDIS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBHIREDIS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/ifupdown2.dep b/rules/ifupdown2.dep
+new file mode 100644
+index 0000000..ec9bd68
+--- /dev/null
++++ b/rules/ifupdown2.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(IFUPDOWN2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/ifupdown2.mk rules/ifupdown2.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(IFUPDOWN2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(IFUPDOWN2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(IFUPDOWN2)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/initramfs-tools.dep b/rules/initramfs-tools.dep
+new file mode 100644
+index 0000000..5176544
+--- /dev/null
++++ b/rules/initramfs-tools.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(INITRAMFS_TOOLS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/initramfs-tools.mk rules/initramfs-tools.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(INITRAMFS_TOOLS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(INITRAMFS_TOOLS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(INITRAMFS_TOOLS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/iproute2.dep b/rules/iproute2.dep
+new file mode 100644
+index 0000000..9e445d9
+--- /dev/null
++++ b/rules/iproute2.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(IPROUTE2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/iproute2.mk rules/iproute2.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(IPROUTE2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(IPROUTE2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(IPROUTE2)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/iptables.dep b/rules/iptables.dep
+new file mode 100644
+index 0000000..eb75121
+--- /dev/null
++++ b/rules/iptables.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(IPTABLES)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/iptables.mk rules/iptables.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(IPTABLES)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(IPTABLES)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(IPTABLES)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/isc-dhcp.dep b/rules/isc-dhcp.dep
+new file mode 100644
+index 0000000..e98df45
+--- /dev/null
++++ b/rules/isc-dhcp.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(ISC_DHCP_RELAY)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/isc-dhcp.mk rules/isc-dhcp.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(ISC_DHCP_RELAY)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(ISC_DHCP_RELAY)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(ISC_DHCP_RELAY)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/ixgbe.dep b/rules/ixgbe.dep
+new file mode 100644
+index 0000000..a8e1ef1
+--- /dev/null
++++ b/rules/ixgbe.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(IXGBE_DRIVER)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/ixgbe.mk rules/ixgbe.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(IXGBE_DRIVER)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(IXGBE_DRIVER)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(IXGBE_DRIVER)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/kdump-tools.dep b/rules/kdump-tools.dep
+new file mode 100644
+index 0000000..041f2e8
+--- /dev/null
++++ b/rules/kdump-tools.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(KDUMP_TOOLS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/kdump-tools.mk rules/kdump-tools.dep 
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(KDUMP_TOOLS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(KDUMP_TOOLS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(KDUMP_TOOLS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/libnl3.dep b/rules/libnl3.dep
+new file mode 100644
+index 0000000..a28b97a
+--- /dev/null
++++ b/rules/libnl3.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBNL3)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/libnl3.mk rules/libnl3.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBNL3)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBNL3)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBNL3)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/libteam.dep b/rules/libteam.dep
+new file mode 100644
+index 0000000..e30ffe6
+--- /dev/null
++++ b/rules/libteam.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBTEAM)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/libteam.mk rules/libteam.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBTEAM)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBTEAM)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBTEAM)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/libyang.dep b/rules/libyang.dep
+new file mode 100644
+index 0000000..681f0c8
+--- /dev/null
++++ b/rules/libyang.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBYANG)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/libyang.mk rules/libyang.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBYANG)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBYANG)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBYANG)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/linux-kernel.dep b/rules/linux-kernel.dep
+new file mode 100644
+index 0000000..6063ddd
+--- /dev/null
++++ b/rules/linux-kernel.dep
+@@ -0,0 +1,15 @@
++
++SPATH       := $($(LINUX_HEADERS_COMMON)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/linux-kernel.mk rules/linux-kernel.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++DEP_FLAGS := $(SONIC_COMMON_FLAGS_LIST) \
++	         $(KERNEL_PROCURE_METHOD) $(KERNEL_CACHE_PATH) 
++
++$(LINUX_HEADERS_COMMON)_CACHE_MODE  := GIT_CONTENT_SHA
++$(LINUX_HEADERS_COMMON)_DEP_FLAGS   := $(DEP_FLAGS)
++$(LINUX_HEADERS_COMMON)_DEP_FILES   := $(DEP_FILES)
++$(LINUX_HEADERS_COMMON)_SMDEP_FILES := $(SMDEP_FILES)
++$(LINUX_HEADERS_COMMON)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/lldpd.dep b/rules/lldpd.dep
+new file mode 100644
+index 0000000..65c2d01
+--- /dev/null
++++ b/rules/lldpd.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LLDPD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/lldpd.mk rules/lldpd.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LLDPD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LLDPD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LLDPD)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/lm-sensors.dep b/rules/lm-sensors.dep
+new file mode 100644
+index 0000000..cc8bb09
+--- /dev/null
++++ b/rules/lm-sensors.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LM_SENSORS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/lm-sensors.mk rules/lm-sensors.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LM_SENSORS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LM_SENSORS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LM_SENSORS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/monit.dep b/rules/monit.dep
+new file mode 100644
+index 0000000..01d04f2
+--- /dev/null
++++ b/rules/monit.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(MONIT)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/monit.mk rules/monit.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(MONIT)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(MONIT)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(MONIT)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/mpdecimal.dep b/rules/mpdecimal.dep
+new file mode 100644
+index 0000000..583b1b5
+--- /dev/null
++++ b/rules/mpdecimal.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBMPDECIMAL)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/mpdecimal.mk rules/mpdecimal.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBMPDECIMAL)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBMPDECIMAL)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBMPDECIMAL)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/phy-credo.dep b/rules/phy-credo.dep
+new file mode 100644
+index 0000000..5c0c9fe
+--- /dev/null
++++ b/rules/phy-credo.dep
+@@ -0,0 +1,8 @@
++
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/phy-credo.mk rules/phy-credo.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++
++$(PHY_CREDO)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(PHY_CREDO)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(PHY_CREDO)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/ptf.dep b/rules/ptf.dep
+new file mode 100644
+index 0000000..9df93e7
+--- /dev/null
++++ b/rules/ptf.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(PTF)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/ptf.mk rules/ptf.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(PTF)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(PTF)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(PTF)_DEP_FILES   := $(DEP_FILES)
++$(PTF)_SMDEP_FILES := $(SMDEP_FILES)
++$(PTF)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/python-click.dep b/rules/python-click.dep
+new file mode 100644
+index 0000000..93e75a7
+--- /dev/null
++++ b/rules/python-click.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(PYTHON_CLICK)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/python-click.mk rules/python-click.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(PYTHON_CLICK)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(PYTHON_CLICK)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(PYTHON_CLICK)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/python3.dep b/rules/python3.dep
+new file mode 100644
+index 0000000..98cc5eb
+--- /dev/null
++++ b/rules/python3.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBPY3_MIN)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/python3.mk rules/python3.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBPY3_MIN)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBPY3_MIN)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBPY3_MIN)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/quagga.dep b/rules/quagga.dep
+new file mode 100644
+index 0000000..abaf234
+--- /dev/null
++++ b/rules/quagga.dep
+@@ -0,0 +1,13 @@
++
++SPATH       := $($(QUAGGA)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/quagga.mk rules/quagga.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++#DPKG_FRK
++$(QUAGGA)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(QUAGGA)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(QUAGGA)_DEP_FILES   := $(DEP_FILES)
++$(QUAGGA)_SMDEP_FILES := $(SMDEP_FILES)
++$(QUAGGA)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/radvd.dep b/rules/radvd.dep
+new file mode 100644
+index 0000000..457a74b
+--- /dev/null
++++ b/rules/radvd.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(RADVD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/radvd.mk rules/radvd.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(RADVD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(RADVD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(RADVD)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/redis-dump-load-py2.dep b/rules/redis-dump-load-py2.dep
+new file mode 100644
+index 0000000..adc4390
+--- /dev/null
++++ b/rules/redis-dump-load-py2.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(REDIS_DUMP_LOAD_PY2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/redis-dump-load-py2.mk rules/redis-dump-load-py2.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(REDIS_DUMP_LOAD_PY2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(REDIS_DUMP_LOAD_PY2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(REDIS_DUMP_LOAD_PY2)_DEP_FILES   := $(DEP_FILES)
++$(REDIS_DUMP_LOAD_PY2)_SMDEP_FILES := $(SMDEP_FILES)
++$(REDIS_DUMP_LOAD_PY2)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/redis.dep b/rules/redis.dep
+new file mode 100644
+index 0000000..1e0562b
+--- /dev/null
++++ b/rules/redis.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(REDIS_TOOLS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/redis.mk rules/redis.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(REDIS_TOOLS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(REDIS_TOOLS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(REDIS_TOOLS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/restapi.dep b/rules/restapi.dep
+new file mode 100644
+index 0000000..97b69c4
+--- /dev/null
++++ b/rules/restapi.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(RESTAPI)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/restapi.mk rules/restapi.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(RESTAPI)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(RESTAPI)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(RESTAPI)_DEP_FILES   := $(DEP_FILES)
++$(RESTAPI)_SMDEP_FILES := $(SMDEP_FILES)
++$(RESTAPI)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sairedis.dep b/rules/sairedis.dep
+new file mode 100644
+index 0000000..f501a78
+--- /dev/null
++++ b/rules/sairedis.dep
+@@ -0,0 +1,17 @@
++
++#DPKG FRK
++SPATH       := $($(LIBSAIREDIS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sairedis.mk rules/sairedis.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++
++SMDEP_PATHS := $(SPATH) $(SPATH)/SAI $(SPATH)/SAI/bm/behavioral-model $(SPATH)/SAI/test/ptf $(SPATH)/SAI/test/saithrift/ctypesgen
++$(foreach path, $(SMDEP_PATHS), $(eval $(path) :=$(filter-out $(SMDEP_PATHS),$(addprefix $(path)/, \
++					$(shell cd $(path)  && git ls-files | grep -v " ")))))
++
++
++$(LIBSAIREDIS)_CACHE_MODE  := GIT_CONTENT_SHA
++$(LIBSAIREDIS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBSAIREDIS)_DEP_FILES   := $(DEP_FILES)
++$(LIBSAIREDIS)_SMDEP_FILES := $(foreach path, $(SMDEP_PATHS), $($(path)))
++$(LIBSAIREDIS)_SMDEP_PATHS := $(SMDEP_PATHS)
++
+diff --git a/rules/scripts.dep b/rules/scripts.dep
+new file mode 100644
+index 0000000..907ec17
+--- /dev/null
++++ b/rules/scripts.dep
+@@ -0,0 +1,8 @@
++#DPKG FRK
++
++$(ARP_UPDATE_SCRIPT)_CACHE_MODE  := none
++$(CONFIGDB_LOAD_SCRIPT)_CACHE_MODE  := none
++$(BUFFERS_CONFIG_TEMPLATE)_CACHE_MODE  := none
++$(UPDATE_PROC_VARIABLES_SCRIPT)_CACHE_MODE  := none
++$(QOS_CONFIG_TEMPLATE)_CACHE_MODE  := none
++$(SUPERVISOR_PROC_EXIT_LISTENER_SCRIPT)_CACHE_MODE  := none
+diff --git a/rules/sflow.dep b/rules/sflow.dep
+new file mode 100644
+index 0000000..b426959
+--- /dev/null
++++ b/rules/sflow.dep
+@@ -0,0 +1,19 @@
++
++SPATH       := $($(HSFLOWD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sflow.mk rules/sflow.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(HSFLOWD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(HSFLOWD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(HSFLOWD)_DEP_FILES   := $(DEP_FILES)
++
++
++$(SFLOWTOOL)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SFLOWTOOL)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SFLOWTOOL)_DEP_FILES   := $(DEP_FILES)
++
++
++$(PSAMPLE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(PSAMPLE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(PSAMPLE)_DEP_FILES   := $(DEP_FILES)
+diff --git a/rules/smartmontools.dep b/rules/smartmontools.dep
+new file mode 100644
+index 0000000..0ca63f5
+--- /dev/null
++++ b/rules/smartmontools.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SMARTMONTOOLS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/smartmontools.mk rules/smartmontools.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SMARTMONTOOLS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SMARTMONTOOLS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SMARTMONTOOLS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/snmpd.dep b/rules/snmpd.dep
+new file mode 100644
+index 0000000..dcab168
+--- /dev/null
++++ b/rules/snmpd.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBSNMP_BASE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/snmpd.mk rules/snmpd.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBSNMP_BASE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBSNMP_BASE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBSNMP_BASE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/socat.dep b/rules/socat.dep
+new file mode 100644
+index 0000000..18dcd87
+--- /dev/null
++++ b/rules/socat.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SOCAT)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/socat.mk rules/socat.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SOCAT)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SOCAT)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SOCAT)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/sonic-config.dep b/rules/sonic-config.dep
+new file mode 100644
+index 0000000..f4c74d0
+--- /dev/null
++++ b/rules/sonic-config.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SONIC_CONFIG_ENGINE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-config.mk rules/sonic-config.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SONIC_CONFIG_ENGINE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_CONFIG_ENGINE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_CONFIG_ENGINE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/sonic-daemon-base.dep b/rules/sonic-daemon-base.dep
+new file mode 100644
+index 0000000..2c6e8a3
+--- /dev/null
++++ b/rules/sonic-daemon-base.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SONIC_DAEMON_BASE_PY2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-daemon-base.mk rules/sonic-daemon-base.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SONIC_DAEMON_BASE_PY2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_DAEMON_BASE_PY2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_DAEMON_BASE_PY2)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/sonic-device-data.dep b/rules/sonic-device-data.dep
+new file mode 100644
+index 0000000..c6105f9
+--- /dev/null
++++ b/rules/sonic-device-data.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SONIC_DEVICE_DATA)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-device-data.mk rules/sonic-device-data.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SONIC_DEVICE_DATA)_CACHE_MODE := GIT_CONTENT_SHA
++$(SONIC_DEVICE_DATA)_DEP_FLAGS  := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_DEVICE_DATA)_DEP_FILES  := $(DEP_FILES)
++
+diff --git a/rules/sonic-ledd.dep b/rules/sonic-ledd.dep
+new file mode 100644
+index 0000000..42e5489
+--- /dev/null
++++ b/rules/sonic-ledd.dep
+@@ -0,0 +1,14 @@
++
++SPATH       := $($(SONIC_LEDD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-ledd.mk rules/sonic-ledd.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SONIC_LEDD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_LEDD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_LEDD)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_LEDD)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_LEDD)_SMDEP_PATHS := $(SPATH)
++
++
++
+diff --git a/rules/sonic-mgmt-framework.dep b/rules/sonic-mgmt-framework.dep
+new file mode 100644
+index 0000000..d714082
+--- /dev/null
++++ b/rules/sonic-mgmt-framework.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SONIC_MGMT_FRAMEWORK)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-mgmt-framework.mk rules/sonic-mgmt-framework.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SONIC_MGMT_FRAMEWORK)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_MGMT_FRAMEWORK)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_MGMT_FRAMEWORK)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_MGMT_FRAMEWORK)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_MGMT_FRAMEWORK)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sonic-platform-common.dep b/rules/sonic-platform-common.dep
+new file mode 100644
+index 0000000..f932401
+--- /dev/null
++++ b/rules/sonic-platform-common.dep
+@@ -0,0 +1,21 @@
++
++SPATH       := $($(SONIC_PLATFORM_COMMON_PY2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-platform-common.mk rules/sonic-platform-common.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files|grep -Ev "sonic_sfp|sonic_eeprom"))
++
++$(SONIC_PLATFORM_COMMON_PY2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_PLATFORM_COMMON_PY2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_PLATFORM_COMMON_PY2)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_PLATFORM_COMMON_PY2)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_PLATFORM_COMMON_PY2)_SMDEP_PATHS := $(SPATH)
++
++
++
++$(SONIC_PLATFORM_COMMON_PY3)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_PLATFORM_COMMON_PY3)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_PLATFORM_COMMON_PY3)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_PLATFORM_COMMON_PY3)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_PLATFORM_COMMON_PY3)_SMDEP_PATHS := $(SPATH)
++
++
+diff --git a/rules/sonic-psud.dep b/rules/sonic-psud.dep
+new file mode 100644
+index 0000000..1999811
+--- /dev/null
++++ b/rules/sonic-psud.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SONIC_PSUD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-psud.mk rules/sonic-psud.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SONIC_PSUD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_PSUD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_PSUD)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_PSUD)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_PSUD)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sonic-syseepromd.dep b/rules/sonic-syseepromd.dep
+new file mode 100644
+index 0000000..a001319
+--- /dev/null
++++ b/rules/sonic-syseepromd.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SONIC_SYSEEPROMD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-syseepromd.mk rules/sonic-syseepromd.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SONIC_SYSEEPROMD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_SYSEEPROMD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_SYSEEPROMD)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_SYSEEPROMD)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_SYSEEPROMD)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sonic-thermalctld.dep b/rules/sonic-thermalctld.dep
+new file mode 100644
+index 0000000..6faa53b
+--- /dev/null
++++ b/rules/sonic-thermalctld.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SONIC_THERMALCTLD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-thermalctld.mk rules/sonic-thermalctld.dep
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SONIC_THERMALCTLD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_THERMALCTLD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_THERMALCTLD)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_THERMALCTLD)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_THERMALCTLD)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sonic-utilities.dep b/rules/sonic-utilities.dep
+new file mode 100644
+index 0000000..9d5f64e
+--- /dev/null
++++ b/rules/sonic-utilities.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SONIC_UTILS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-utilities.mk rules/sonic-utilities.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SONIC_UTILS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_UTILS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_UTILS)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_UTILS)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_UTILS)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sonic-xcvrd.dep b/rules/sonic-xcvrd.dep
+new file mode 100644
+index 0000000..25c1e8c
+--- /dev/null
++++ b/rules/sonic-xcvrd.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SONIC_XCVRD)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-xcvrd.mk rules/sonic-xcvrd.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SONIC_XCVRD)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_XCVRD)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_XCVRD)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_XCVRD)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_XCVRD)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sonic-ztp.dep b/rules/sonic-ztp.dep
+new file mode 100644
+index 0000000..32890c5
+--- /dev/null
++++ b/rules/sonic-ztp.dep
+@@ -0,0 +1,13 @@
++
++SPATH       := $($(SONIC_ZTP)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-ztp.mk rules/sonic-ztp.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files|grep -Ev "inband-ztp-ip|dhclient-exit-hooks.d/ztp"))
++
++
++$(SONIC_ZTP)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_ZTP)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_ZTP)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_ZTP)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_ZTP)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/sonic-ztp.mk b/rules/sonic-ztp.mk
+index 43615b7..3f64feb 100644
+--- a/rules/sonic-ztp.mk
++++ b/rules/sonic-ztp.mk
+@@ -1,8 +1,6 @@
+ # SONiC ztp package
+ #
+ 
+-ifeq ($(ENABLE_ZTP), y)
+-
+ SONIC_ZTP_VERSION = 1.0.0
+ 
+ SONIC_ZTP = sonic-ztp_$(SONIC_ZTP_VERSION)_all.deb
+@@ -13,5 +11,4 @@ SONIC_STRETCH_DEBS += $(SONIC_ZTP)
+ export SONIC_ZTP_VERSION
+ export SONIC_ZTP
+ 
+-endif
+ 
+diff --git a/rules/supervisor.dep b/rules/supervisor.dep
+new file mode 100644
+index 0000000..7d7bcf3
+--- /dev/null
++++ b/rules/supervisor.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SUPERVISOR)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/supervisor.mk rules/supervisor.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SUPERVISOR)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SUPERVISOR)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SUPERVISOR)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/swig.dep b/rules/swig.dep
+new file mode 100644
+index 0000000..603dc55
+--- /dev/null
++++ b/rules/swig.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SWIG_BASE)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/swig.mk rules/swig.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SWIG_BASE)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SWIG_BASE)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SWIG_BASE)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/swss-common.dep b/rules/swss-common.dep
+new file mode 100644
+index 0000000..b4e95a9
+--- /dev/null
++++ b/rules/swss-common.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(LIBSWSSCOMMON)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/swss-common.mk rules/swss-common.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(LIBSWSSCOMMON)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBSWSSCOMMON)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBSWSSCOMMON)_DEP_FILES   := $(DEP_FILES)
++$(LIBSWSSCOMMON)_SMDEP_FILES := $(SMDEP_FILES)
++$(LIBSWSSCOMMON)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/swss.dep b/rules/swss.dep
+new file mode 100644
+index 0000000..e57a9e7
+--- /dev/null
++++ b/rules/swss.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SWSS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/swss.mk rules/swss.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SWSS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SWSS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SWSS)_DEP_FILES   := $(DEP_FILES)
++$(SWSS)_SMDEP_FILES := $(SMDEP_FILES)
++$(SWSS)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/swsssdk-py2.dep b/rules/swsssdk-py2.dep
+new file mode 100644
+index 0000000..2be9565
+--- /dev/null
++++ b/rules/swsssdk-py2.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SWSSSDK_PY2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/swsssdk-py2.mk rules/swsssdk-py2.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SWSSSDK_PY2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SWSSSDK_PY2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SWSSSDK_PY2)_DEP_FILES   := $(DEP_FILES)
++$(SWSSSDK_PY2)_SMDEP_FILES := $(SMDEP_FILES)
++$(SWSSSDK_PY2)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/swsssdk-py3.dep b/rules/swsssdk-py3.dep
+new file mode 100644
+index 0000000..4119d9f
+--- /dev/null
++++ b/rules/swsssdk-py3.dep
+@@ -0,0 +1,12 @@
++
++SPATH       := $($(SWSSSDK_PY3)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/swsssdk-py3.mk rules/swsssdk-py3.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++$(SWSSSDK_PY3)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SWSSSDK_PY3)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SWSSSDK_PY3)_DEP_FILES   := $(DEP_FILES)
++$(SWSSSDK_PY3)_SMDEP_FILES := $(SMDEP_FILES)
++$(SWSSSDK_PY3)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/systemd-sonic-generator.dep b/rules/systemd-sonic-generator.dep
+new file mode 100644
+index 0000000..d6094c0
+--- /dev/null
++++ b/rules/systemd-sonic-generator.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(SYSTEMD_SONIC_GENERATOR)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/systemd-sonic-generator.mk rules/systemd-sonic-generator.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(SYSTEMD_SONIC_GENERATOR)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SYSTEMD_SONIC_GENERATOR)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SYSTEMD_SONIC_GENERATOR)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/tacacs.dep b/rules/tacacs.dep
+new file mode 100644
+index 0000000..29de926
+--- /dev/null
++++ b/rules/tacacs.dep
+@@ -0,0 +1,23 @@
++#DPKG FRK
++
++SPATH       := $($(LIBTAC2)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/tacacs.mk rules/tacacs.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBTAC2)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBTAC2)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBTAC2)_DEP_FILES   := $(DEP_FILES)
++
++
++
++
++SPATH       := $($(LIBNSS_TACPLUS)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/tacacs.mk rules/tacacs.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBNSS_TACPLUS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBNSS_TACPLUS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBNSS_TACPLUS)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/rules/telemetry.dep b/rules/telemetry.dep
+new file mode 100644
+index 0000000..d759b3a
+--- /dev/null
++++ b/rules/telemetry.dep
+@@ -0,0 +1,13 @@
++#DPKG FRK
++SPATH       := $($(SONIC_TELEMETRY)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/telemetry.mk rules/telemetry.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++
++$(SONIC_TELEMETRY)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_TELEMETRY)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(SONIC_TELEMETRY)_DEP_FILES   := $(DEP_FILES)
++$(SONIC_TELEMETRY)_SMDEP_FILES := $(SMDEP_FILES)
++$(SONIC_TELEMETRY)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/template.dep b/rules/template.dep
+new file mode 100644
+index 0000000..d110c2e
+--- /dev/null
++++ b/rules/template.dep
+@@ -0,0 +1,49 @@
++#DPKG FRK
++
++# This provides a template for adding a DPKG cache rule for a new module
++#
++#  __NEW_MODULE__ => Name of the module to be cached
++#  __NEW_RULES__  => Module rule name
++#  If a module is linked as a submodule, all the depencency files should be added in the _SMDEP_FILES rule
++#  All other dependency files should be added in the  _DEP_FILES rule
++#  All the ENV flags should be added in the _DEP_FLAGS rule
++#  If module has multiple source path as a submodule, it should be added as prt of _SMDEP_PATHS rule
++
++#Source path of the module
++SPATH       := $($(__NEW_MODULE__)_SRC_PATH)
++
++# Add all the dependendency files in the DEP_FILES variable
++# SONIC_COMMON_FILES_LIST => It includes common files like .platform, slave.mk, rules/functions etc
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/__NEW_RULES__.mk rules/__NEW_RULES__.dep   
++
++# SONIC_COMMON_BASE_FILES_LIST => It includes base docker files like Dockerfile, Dockerfile.user etc
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++
++# If a module source files are part of sonic-buildimage, add the source files to DEP_FILES variable
++#DEP_FILES   += $(shell git ls-files $(SPATH))
++
++# If the module is a submodule, add all the submodule source files into SMDEP_FILES variable
++#SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
++
++
++
++
++# Define the DPKG cache rule for a module
++# Set the Cache mode,
++# GIT_CONTENT_SHA => Cache SHA is derived from contents of the module dependency files
++# GIT_COMMIT_SHA => Cache SHA is derived from the last commit id of a module 
++$(__NEW_MODULE__)_CACHE_MODE  := GIT_CONTENT_SHA 
++
++# List all the environment flags that module depends on
++# SONIC_COMMON_FLAGS_LIST => It includes the defaults flags like SONIC_DEBUGGING_ON, SONIC_PROFILE_ON etc
++$(__NEW_MODULE__)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++
++# List all the dependency files
++$(__NEW_MODULE__)_DEP_FILES   := $(DEP_FILES)
++
++# List all the sub module dependendency files	
++#$(__NEW_MODULE__)_SMDEP_FILES := $(SMDEP_FILES)
++
++# List all the sub module paths
++#$(__NEW_MODULE__)_SMDEP_PATHS := $(SPATH)
++
+diff --git a/rules/thrift.dep b/rules/thrift.dep
+new file mode 100644
+index 0000000..a1700a9
+--- /dev/null
++++ b/rules/thrift.dep
+@@ -0,0 +1,10 @@
++
++SPATH       := $($(LIBTHRIFT)_SRC_PATH)
++DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/thrift.mk rules/thrift.dep   
++DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
++DEP_FILES   += $(shell git ls-files $(SPATH))
++
++$(LIBTHRIFT)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBTHRIFT)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
++$(LIBTHRIFT)_DEP_FILES   := $(DEP_FILES)
++
+diff --git a/slave.mk b/slave.mk
+index 0c4f2c7..924ad93 100644
+--- a/slave.mk
++++ b/slave.mk
+@@ -210,7 +210,8 @@ $(info "BLDENV"                          : "$(BLDENV)")
+ $(info "VS_PREPARE_MEM"                  : "$(VS_PREPARE_MEM)")
+ $(info "ENABLE_SFLOW"                    : "$(ENABLE_SFLOW)")
+ $(info "ENABLE_NAT"                      : "$(ENABLE_NAT)")
+-$(info )
++
++include Makefile.cache
+ 
+ ifeq ($(SONIC_USE_DOCKER_BUILDKIT),y)
+ $(warning "Using SONIC_USE_DOCKER_BUILDKIT will produce larger installable SONiC image because of a docker bug (more details: https://github.com/moby/moby/issues/38903)")
+@@ -265,10 +266,23 @@ SONIC_TARGET_LIST += $(addprefix $(FILES_PATH)/, $(SONIC_COPY_FILES))
+ #     SOME_NEW_DEB = some_new_deb.deb
+ #     $(SOME_NEW_DEB)_URL = https://url/to/this/deb.deb
+ #     SONIC_ONLINE_DEBS += $(SOME_NEW_DEB)
+-$(addprefix $(DEBS_PATH)/, $(SONIC_ONLINE_DEBS)) : $(DEBS_PATH)/% : .platform
++$(addprefix $(DEBS_PATH)/, $(SONIC_ONLINE_DEBS)) : $(DEBS_PATH)/% : .platform \
++	$(call dpkg_depend,$(DEBS_PATH)/%.dep)
++
+ 	$(HEADER)
+-	$(foreach deb,$* $($*_DERIVED_DEBS), \
+-	    { wget --no-use-server-timestamps -O $(DEBS_PATH)/$(deb) $($(deb)_URL) $(LOG) || exit 1 ; } ; )
++##removing to resolve conflict while cherry-picking 7d2ebf8 from master to jnpr/201911
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*,$@)
++
++	# Skip building the target if it is already loaded from cache
++	if [ -z '$($*_CACHE_LOADED)' ] ; then
++
++		$(foreach deb,$* $($*_DERIVED_DEBS), \
++			{ curl -L -f -o $(DEBS_PATH)/$(deb) $($(deb)_URL) $(LOG) || { exit 1 ; } } ; )
++		
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*,$@)
++	fi
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(DEBS_PATH)/, $(SONIC_ONLINE_DEBS))
+@@ -298,16 +312,28 @@ SONIC_TARGET_LIST += $(addprefix $(FILES_PATH)/, $(SONIC_ONLINE_FILES))
+ #     $(SOME_NEW_FILE)_SRC_PATH = $(SRC_PATH)/project_name
+ #     $(SOME_NEW_FILE)_DEPENDS = $(SOME_OTHER_DEB1) $(SOME_OTHER_DEB2) ...
+ #     SONIC_MAKE_FILES += $(SOME_NEW_FILE)
+-$(addprefix $(FILES_PATH)/, $(SONIC_MAKE_FILES)) : $(FILES_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(DEBS_PATH)/,$$($$*_DEPENDS)))
++$(addprefix $(FILES_PATH)/, $(SONIC_MAKE_FILES)) : $(FILES_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(DEBS_PATH)/,$$($$*_DEPENDS))) \
++			$(call dpkg_depend,$(FILES_PATH)/%.dep)
+ 	$(HEADER)
+-	# Remove target to force rebuild
+-	rm -f $(addprefix $(FILES_PATH)/, $*)
+-	# Apply series of patches if exist
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
+-	# Build project and take package
+-	make DEST=$(shell pwd)/$(FILES_PATH) -C $($*_SRC_PATH) $(shell pwd)/$(FILES_PATH)/$* $(LOG)
+-	# Clean up
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
++
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*,$@)
++
++		# Skip building the target if it is already loaded from cache
++		if [ -z '$($*_CACHE_LOADED)' ] ; then
++		# Remove target to force rebuild
++		rm -f $(addprefix $(FILES_PATH)/, $*)
++		# Apply series of patches if exist
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
++		# Build project and take package
++		make DEST=$(shell pwd)/$(FILES_PATH) -C $($*_SRC_PATH) $(shell pwd)/$(FILES_PATH)/$* $(LOG)
++		# Clean up
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
++
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*,$@)
++
++	fi
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(FILES_PATH)/, $(SONIC_MAKE_FILES))
+@@ -324,16 +350,30 @@ SONIC_TARGET_LIST += $(addprefix $(FILES_PATH)/, $(SONIC_MAKE_FILES))
+ #     $(SOME_NEW_DEB)_SRC_PATH = $(SRC_PATH)/project_name
+ #     $(SOME_NEW_DEB)_DEPENDS = $(SOME_OTHER_DEB1) $(SOME_OTHER_DEB2) ...
+ #     SONIC_MAKE_DEBS += $(SOME_NEW_DEB)
+-$(addprefix $(DEBS_PATH)/, $(SONIC_MAKE_DEBS)) : $(DEBS_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(DEBS_PATH)/,$$($$*_DEPENDS)))
++$(addprefix $(DEBS_PATH)/, $(SONIC_MAKE_DEBS)) : $(DEBS_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(DEBS_PATH)/,$$($$*_DEPENDS))) \
++			$(call dpkg_depend,$(DEBS_PATH)/%.dep)
+ 	$(HEADER)
+-	# Remove target to force rebuild
+-	rm -f $(addprefix $(DEBS_PATH)/, $* $($*_DERIVED_DEBS) $($*_EXTRA_DEBS))
+-	# Apply series of patches if exist
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
+-	# Build project and take package
+-	DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS_GENERIC}" make DEST=$(shell pwd)/$(DEBS_PATH) -C $($*_SRC_PATH) $(shell pwd)/$(DEBS_PATH)/$* $(LOG)
+-	# Clean up
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
++
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*,$@)
++
++	# Skip building the target if it is already loaded from cache
++	if [ -z '$($*_CACHE_LOADED)' ] ; then
++
++		# Remove target to force rebuild
++		rm -f $(addprefix $(DEBS_PATH)/, $* $($*_DERIVED_DEBS) $($*_EXTRA_DEBS))
++		# Apply series of patches if exist
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
++		# Build project and take package
++		DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS_GENERIC}" make DEST=$(shell pwd)/$(DEBS_PATH) -C $($*_SRC_PATH) $(shell pwd)/$(DEBS_PATH)/$* $(LOG)
++		# Clean up
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
++
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*,$@)
++
++	fi
++
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(DEBS_PATH)/, $(SONIC_MAKE_DEBS))
+@@ -344,24 +384,37 @@ SONIC_TARGET_LIST += $(addprefix $(DEBS_PATH)/, $(SONIC_MAKE_DEBS))
+ #     $(SOME_NEW_DEB)_SRC_PATH = $(SRC_PATH)/project_name
+ #     $(SOME_NEW_DEB)_DEPENDS = $(SOME_OTHER_DEB1) $(SOME_OTHER_DEB2) ...
+ #     SONIC_DPKG_DEBS += $(SOME_NEW_DEB)
+-$(addprefix $(DEBS_PATH)/, $(SONIC_DPKG_DEBS)) : $(DEBS_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(DEBS_PATH)/,$$($$*_DEPENDS)))
++$(addprefix $(DEBS_PATH)/, $(SONIC_DPKG_DEBS)) : $(DEBS_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(DEBS_PATH)/,$$($$*_DEPENDS))) \
++			$(call dpkg_depend,$(DEBS_PATH)/%.dep )
+ 	$(HEADER)
+-	# Remove old build logs if they exist
+-	rm -f $($*_SRC_PATH)/debian/*.debhelper.log
+-	# Apply series of patches if exist
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
+-	# Build project
+-	pushd $($*_SRC_PATH) $(LOG)
+-	[ ! -f ./autogen.sh ] || ./autogen.sh $(LOG)
+-	$(if $($*_DPKG_TARGET),
+-		DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS_GENERIC} ${$*_DEB_BUILD_OPTIONS}" dpkg-buildpackage -rfakeroot -b -us -uc -j$(SONIC_CONFIG_MAKE_JOBS) --as-root -T$($*_DPKG_TARGET) $(LOG),
+-		DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS_GENERIC} ${$*_DEB_BUILD_OPTIONS}" dpkg-buildpackage -rfakeroot -b -us -uc -j$(SONIC_CONFIG_MAKE_JOBS) $(LOG)
+-	)
+-	popd $(LOG)
+-	# Clean up
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
+-	# Take built package(s)
+-	mv $(addprefix $($*_SRC_PATH)/../, $* $($*_DERIVED_DEBS) $($*_EXTRA_DEBS)) $(DEBS_PATH) $(LOG)
++
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*,$@)
++
++	# Skip building the target if it is already loaded from cache
++	if [ -z '$($*_CACHE_LOADED)' ] ; then
++
++		# Remove old build logs if they exist
++		rm -f $($*_SRC_PATH)/debian/*.debhelper.log
++		# Apply series of patches if exist
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
++		# Build project
++		pushd $($*_SRC_PATH) $(LOG)
++		[ ! -f ./autogen.sh ] || ./autogen.sh $(LOG)
++		$(if $($*_DPKG_TARGET),
++			DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS_GENERIC} ${$*_DEB_BUILD_OPTIONS}" dpkg-buildpackage -rfakeroot -b -us -uc -j$(SONIC_CONFIG_MAKE_JOBS) --as-root -T$($*_DPKG_TARGET) $(LOG),
++			DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS_GENERIC} ${$*_DEB_BUILD_OPTIONS}" dpkg-buildpackage -rfakeroot -b -us -uc -j$(SONIC_CONFIG_MAKE_JOBS) $(LOG)
++		)
++		popd $(LOG)
++		# Clean up
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
++		# Take built package(s)
++		mv $(addprefix $($*_SRC_PATH)/../, $* $($*_DERIVED_DEBS) $($*_EXTRA_DEBS)) $(DEBS_PATH) $(LOG)
++
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*,$@)
++	fi
++
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(DEBS_PATH)/, $(SONIC_DPKG_DEBS))
+@@ -428,19 +481,33 @@ $(SONIC_INSTALL_TARGETS) : $(DEBS_PATH)/%-install : .platform $$(addsuffix -inst
+ #     SONIC_PYTHON_STDEB_DEBS += $(SOME_NEW_DEB)
+ $(addprefix $(PYTHON_DEBS_PATH)/, $(SONIC_PYTHON_STDEB_DEBS)) : $(PYTHON_DEBS_PATH)/% : .platform \
+ 		$$(addsuffix -install,$$(addprefix $(PYTHON_DEBS_PATH)/,$$($$*_DEPENDS))) \
+-		$$(addsuffix -install,$$(addprefix $(PYTHON_WHEELS_PATH)/,$$($$*_WHEEL_DEPENDS)))
++		$$(addsuffix -install,$$(addprefix $(PYTHON_WHEELS_PATH)/,$$($$*_WHEEL_DEPENDS))) \
++		$(call dpkg_depend,$(PYTHON_DEBS_PATH)/%.dep)
++
+ 	$(HEADER)
+-	# Apply series of patches if exist
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
+-	# Build project
+-	pushd $($*_SRC_PATH) $(LOG)
+-	rm -rf deb_dist/* $(LOG)
+-	python setup.py --command-packages=stdeb.command bdist_deb $(LOG)
+-	popd $(LOG)
+-	# Clean up
+-	if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
+-	# Take built package(s)
+-	mv $(addprefix $($*_SRC_PATH)/deb_dist/, $* $($*_DERIVED_DEBS)) $(PYTHON_DEBS_PATH) $(LOG)
++
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*,$@)
++
++	# Skip building the target if it is already loaded from cache
++	if [ -z '$($*_CACHE_LOADED)' ] ; then
++
++		# Apply series of patches if exist
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; popd; fi
++		# Build project
++		pushd $($*_SRC_PATH) $(LOG)
++		rm -rf deb_dist/* $(LOG)
++		python setup.py --command-packages=stdeb.command bdist_deb $(LOG)
++		popd $(LOG)
++		# Clean up
++		if [ -f $($*_SRC_PATH).patch/series ]; then pushd $($*_SRC_PATH) && quilt pop -a -f; popd; fi
++		# Take built package(s)
++		mv $(addprefix $($*_SRC_PATH)/deb_dist/, $* $($*_DERIVED_DEBS)) $(PYTHON_DEBS_PATH) $(LOG)
++
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*,$@)
++	fi
++
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(PYTHON_DEBS_PATH)/, $(SONIC_PYTHON_STDEB_DEBS))
+@@ -453,17 +520,31 @@ SONIC_TARGET_LIST += $(addprefix $(PYTHON_DEBS_PATH)/, $(SONIC_PYTHON_STDEB_DEBS
+ #     $(SOME_NEW_WHL)_PYTHON_VERSION = 2 (or 3)
+ #     $(SOME_NEW_WHL)_DEPENDS = $(SOME_OTHER_WHL1) $(SOME_OTHER_WHL2) ...
+ #     SONIC_PYTHON_WHEELS += $(SOME_NEW_WHL)
+-$(addprefix $(PYTHON_WHEELS_PATH)/, $(SONIC_PYTHON_WHEELS)) : $(PYTHON_WHEELS_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(PYTHON_WHEELS_PATH)/,$$($$*_DEPENDS)))
++$(addprefix $(PYTHON_WHEELS_PATH)/, $(SONIC_PYTHON_WHEELS)) : $(PYTHON_WHEELS_PATH)/% : .platform $$(addsuffix -install,$$(addprefix $(PYTHON_WHEELS_PATH)/,$$($$*_DEPENDS))) \
++			$(call dpkg_depend,$(PYTHON_WHEELS_PATH)/%.dep)
++
+ 	$(HEADER)
+-	pushd $($*_SRC_PATH) $(LOG)
+-	# apply series of patches if exist
+-	if [ -f ../$(notdir $($*_SRC_PATH)).patch/series ]; then QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; fi
+-	[ "$($*_TEST)" = "n" ] || python$($*_PYTHON_VERSION) setup.py test $(LOG)
+-	python$($*_PYTHON_VERSION) setup.py bdist_wheel $(LOG)
+-	# clean up
+-	if [ -f ../$(notdir $($*_SRC_PATH)).patch/series ]; then quilt pop -a -f; fi
+-	popd $(LOG)
+-	mv $($*_SRC_PATH)/dist/$* $(PYTHON_WHEELS_PATH) $(LOG)
++
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*,$@)
++
++	# Skip building the target if it is already loaded from cache
++	if [ -z '$($*_CACHE_LOADED)' ] ; then
++
++		pushd $($*_SRC_PATH) $(LOG)
++		# apply series of patches if exist
++		if [ -f ../$(notdir $($*_SRC_PATH)).patch/series ]; then QUILT_PATCHES=../$(notdir $($*_SRC_PATH)).patch quilt push -a; fi
++		[ "$($*_TEST)" = "n" ] || python$($*_PYTHON_VERSION) setup.py test $(LOG)
++		python$($*_PYTHON_VERSION) setup.py bdist_wheel $(LOG)
++		# clean up
++		if [ -f ../$(notdir $($*_SRC_PATH)).patch/series ]; then quilt pop -a -f; fi
++		popd $(LOG)
++		mv $($*_SRC_PATH)/dist/$* $(PYTHON_WHEELS_PATH) $(LOG)
++		
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*,$@)
++	fi
++
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(PYTHON_WHEELS_PATH)/, $(SONIC_PYTHON_WHEELS))
+@@ -534,39 +615,52 @@ $(addprefix $(TARGET_PATH)/, $(DOCKER_IMAGES)) : $(TARGET_PATH)/%.gz : .platform
+ 		$$(addprefix $(PYTHON_DEBS_PATH)/,$$($$*.gz_PYTHON_DEBS)) \
+ 		$$(addprefix $(PYTHON_WHEELS_PATH)/,$$($$*.gz_PYTHON_WHEELS)) \
+ 		$$(addsuffix -load,$$(addprefix $(TARGET_PATH)/,$$($$*.gz_LOAD_DOCKERS))) \
+-		$$($$*.gz_PATH)/Dockerfile.j2
++		$$($$*.gz_PATH)/Dockerfile.j2 \
++		$(call dpkg_depend,$(TARGET_PATH)/%.gz.dep)
+ 	$(HEADER)
+-	# Apply series of patches if exist
+-	if [ -f $($*.gz_PATH).patch/series ]; then pushd $($*.gz_PATH) && QUILT_PATCHES=../$(notdir $($*.gz_PATH)).patch quilt push -a; popd; fi
+-	mkdir -p $($*.gz_PATH)/debs $(LOG)
+-	mkdir -p $($*.gz_PATH)/files $(LOG)
+-	mkdir -p $($*.gz_PATH)/python-debs $(LOG)
+-	mkdir -p $($*.gz_PATH)/python-wheels $(LOG)
+-	sudo mount --bind $(DEBS_PATH) $($*.gz_PATH)/debs $(LOG)
+-	sudo mount --bind $(FILES_PATH) $($*.gz_PATH)/files $(LOG)
+-	sudo mount --bind $(PYTHON_DEBS_PATH) $($*.gz_PATH)/python-debs $(LOG)
+-	sudo mount --bind $(PYTHON_WHEELS_PATH) $($*.gz_PATH)/python-wheels $(LOG)
+-	# Export variables for j2. Use path for unique variable names, e.g. docker_orchagent_debs
+-	$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_debs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DEPENDS),RDEPENDS))\n" | awk '!a[$$0]++'))
+-	$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_pydebs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_PYTHON_DEBS)))\n" | awk '!a[$$0]++'))
+-	$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_whls=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_PYTHON_WHEELS)))\n" | awk '!a[$$0]++'))
+-	$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_dbgs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DBG_PACKAGES)))\n" | awk '!a[$$0]++'))
+-	j2 $($*.gz_PATH)/Dockerfile.j2 > $($*.gz_PATH)/Dockerfile
+-	docker info $(LOG)
+-	docker build --squash --no-cache \
+-		--build-arg http_proxy=$(HTTP_PROXY) \
+-		--build-arg https_proxy=$(HTTPS_PROXY) \
+-		--build-arg user=$(USER) \
+-		--build-arg uid=$(UID) \
+-		--build-arg guid=$(GUID) \
+-		--build-arg docker_container_name=$($*.gz_CONTAINER_NAME) \
+-		--build-arg frr_user_uid=$(FRR_USER_UID) \
+-		--build-arg frr_user_gid=$(FRR_USER_GID) \
+-		--label Tag=$(SONIC_GET_VERSION) \
+-		-t $* $($*.gz_PATH) $(LOG)
+-	docker save $* | gzip -c > $@
+-	# Clean up
+-	if [ -f $($*.gz_PATH).patch/series ]; then pushd $($*.gz_PATH) && quilt pop -a -f; popd; fi
++
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*.gz,$@)
++
++	# Skip building the target if it is already loaded from cache
++	if [ -z '$($*.gz_CACHE_LOADED)' ] ; then
++
++		# Apply series of patches if exist
++		if [ -f $($*.gz_PATH).patch/series ]; then pushd $($*.gz_PATH) && QUILT_PATCHES=../$(notdir $($*.gz_PATH)).patch quilt push -a; popd; fi
++		mkdir -p $($*.gz_PATH)/debs $(LOG)
++		mkdir -p $($*.gz_PATH)/files $(LOG)
++		mkdir -p $($*.gz_PATH)/python-debs $(LOG)
++		mkdir -p $($*.gz_PATH)/python-wheels $(LOG)
++		sudo mount --bind $(DEBS_PATH) $($*.gz_PATH)/debs $(LOG)
++		sudo mount --bind $(FILES_PATH) $($*.gz_PATH)/files $(LOG)
++		sudo mount --bind $(PYTHON_DEBS_PATH) $($*.gz_PATH)/python-debs $(LOG)
++		sudo mount --bind $(PYTHON_WHEELS_PATH) $($*.gz_PATH)/python-wheels $(LOG)
++		# Export variables for j2. Use path for unique variable names, e.g. docker_orchagent_debs
++		$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_debs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DEPENDS),RDEPENDS))\n" | awk '!a[$$0]++'))
++		$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_pydebs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_PYTHON_DEBS)))\n" | awk '!a[$$0]++'))
++		$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_whls=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_PYTHON_WHEELS)))\n" | awk '!a[$$0]++'))
++		$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_dbgs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DBG_PACKAGES)))\n" | awk '!a[$$0]++'))
++		j2 $($*.gz_PATH)/Dockerfile.j2 > $($*.gz_PATH)/Dockerfile
++		docker info $(LOG)
++		docker build --squash --no-cache \
++			--build-arg http_proxy=$(HTTP_PROXY) \
++			--build-arg https_proxy=$(HTTPS_PROXY) \
++			--build-arg user=$(USER) \
++			--build-arg uid=$(UID) \
++			--build-arg guid=$(GUID) \
++			--build-arg docker_container_name=$($*.gz_CONTAINER_NAME) \
++			--build-arg frr_user_uid=$(FRR_USER_UID) \
++			--build-arg frr_user_gid=$(FRR_USER_GID) \
++			--label Tag=$(SONIC_GET_VERSION) \
++			-t $* $($*.gz_PATH) $(LOG)
++		docker save $* | gzip -c > $@
++		# Clean up
++		if [ -f $($*.gz_PATH).patch/series ]; then pushd $($*.gz_PATH) && quilt pop -a -f; popd; fi
++		
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*.gz,$@)
++	fi
++
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(TARGET_PATH)/, $(DOCKER_IMAGES))
+@@ -574,27 +668,40 @@ SONIC_TARGET_LIST += $(addprefix $(TARGET_PATH)/, $(DOCKER_IMAGES))
+ # Targets for building docker images
+ $(addprefix $(TARGET_PATH)/, $(DOCKER_DBG_IMAGES)) : $(TARGET_PATH)/%-$(DBG_IMAGE_MARK).gz : .platform docker-start \
+ 		$$(addprefix $(DEBS_PATH)/,$$($$*.gz_DBG_DEPENDS)) \
+-		$$(addsuffix -load,$$(addprefix $(TARGET_PATH)/,$$*.gz))
++		$$(addsuffix -load,$$(addprefix $(TARGET_PATH)/,$$*.gz)) \
++		$(call dpkg_depend,$(TARGET_PATH)/%-$(DBG_IMAGE_MARK).gz.dep)
+ 	$(HEADER)
+-	mkdir -p $($*.gz_PATH)/debs $(LOG)
+-	sudo mount --bind $(DEBS_PATH) $($*.gz_PATH)/debs $(LOG)
+-	# Export variables for j2. Use path for unique variable names, e.g. docker_orchagent_debs
+-	$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_dbg_debs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DBG_DEPENDS),RDEPENDS))\n" | awk '!a[$$0]++'))
+-	$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_image_dbgs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DBG_IMAGE_PACKAGES)))\n" | awk '!a[$$0]++'))
+-	./build_debug_docker_j2.sh $* $(subst -,_,$(notdir $($*.gz_PATH)))_dbg_debs $(subst -,_,$(notdir $($*.gz_PATH)))_image_dbgs > $($*.gz_PATH)/Dockerfile-dbg.j2
+-	j2 $($*.gz_PATH)/Dockerfile-dbg.j2 > $($*.gz_PATH)/Dockerfile-dbg
+-	docker info $(LOG)
+-	docker build \
+-		$(if $($*.gz_DBG_DEPENDS), --squash --no-cache, --no-cache) \
+-		--build-arg http_proxy=$(HTTP_PROXY) \
+-		--build-arg https_proxy=$(HTTPS_PROXY) \
+-		--build-arg docker_container_name=$($*.gz_CONTAINER_NAME) \
+-		--label Tag=$(SONIC_GET_VERSION) \
+-		--file $($*.gz_PATH)/Dockerfile-dbg \
+-		-t $*-dbg $($*.gz_PATH) $(LOG)
+-	docker save $*-dbg | gzip -c > $@
+-	# Clean up
+-	if [ -f $($*.gz_PATH).patch/series ]; then pushd $($*.gz_PATH) && quilt pop -a -f; popd; fi
++
++	# Load the target deb from DPKG cache
++	$(call LOAD_CACHE,$*-$(DBG_IMAGE_MARK).gz,$@)
++
++	# Skip building the target if it is already loaded from cache
++	if [ -z '$($*-$(DBG_IMAGE_MARK).gz_CACHE_LOADED)' ] ; then
++
++		mkdir -p $($*.gz_PATH)/debs $(LOG)
++		sudo mount --bind $(DEBS_PATH) $($*.gz_PATH)/debs $(LOG)
++		# Export variables for j2. Use path for unique variable names, e.g. docker_orchagent_debs
++		$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_dbg_debs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DBG_DEPENDS),RDEPENDS))\n" | awk '!a[$$0]++'))
++		$(eval export $(subst -,_,$(notdir $($*.gz_PATH)))_image_dbgs=$(shell printf "$(subst $(SPACE),\n,$(call expand,$($*.gz_DBG_IMAGE_PACKAGES)))\n" | awk '!a[$$0]++'))
++		./build_debug_docker_j2.sh $* $(subst -,_,$(notdir $($*.gz_PATH)))_dbg_debs $(subst -,_,$(notdir $($*.gz_PATH)))_image_dbgs > $($*.gz_PATH)/Dockerfile-dbg.j2
++		j2 $($*.gz_PATH)/Dockerfile-dbg.j2 > $($*.gz_PATH)/Dockerfile-dbg
++		docker info $(LOG)
++		docker build \
++			$(if $($*.gz_DBG_DEPENDS), --squash --no-cache, --no-cache) \
++			--build-arg http_proxy=$(HTTP_PROXY) \
++			--build-arg https_proxy=$(HTTPS_PROXY) \
++			--build-arg docker_container_name=$($*.gz_CONTAINER_NAME) \
++			--label Tag=$(SONIC_GET_VERSION) \
++			--file $($*.gz_PATH)/Dockerfile-dbg \
++			-t $*-dbg $($*.gz_PATH) $(LOG)
++		docker save $*-dbg | gzip -c > $@
++		# Clean up
++		if [ -f $($*.gz_PATH).patch/series ]; then pushd $($*.gz_PATH) && quilt pop -a -f; popd; fi
++
++		# Save the target deb into DPKG cache
++		$(call SAVE_CACHE,$*-$(DBG_IMAGE_MARK).gz,$@)
++	fi
++
+ 	$(FOOTER)
+ 
+ SONIC_TARGET_LIST += $(addprefix $(TARGET_PATH)/, $(DOCKER_DBG_IMAGES))
+@@ -777,12 +884,12 @@ SONIC_CLEAN_FILES = $(addsuffix -clean,$(addprefix $(FILES_PATH)/, \
+ 		   $(SONIC_COPY_FILES) \
+ 		   $(SONIC_MAKE_FILES)))
+ 
+-$(SONIC_CLEAN_DEBS) : $(DEBS_PATH)/%-clean : .platform $$(addsuffix -clean,$$(addprefix $(DEBS_PATH)/,$$($$*_MAIN_DEB)))
++$(SONIC_CLEAN_DEBS) :: $(DEBS_PATH)/%-clean : .platform $$(addsuffix -clean,$$(addprefix $(DEBS_PATH)/,$$($$*_MAIN_DEB)))
+ 	@# remove derived or extra targets if main one is removed, because we treat them
+ 	@# as part of one package
+ 	@rm -f $(addprefix $(DEBS_PATH)/, $* $($*_DERIVED_DEBS) $($*_EXTRA_DEBS))
+ 
+-$(SONIC_CLEAN_FILES) : $(FILES_PATH)/%-clean : .platform
++$(SONIC_CLEAN_FILES) :: $(FILES_PATH)/%-clean : .platform
+ 	@rm -f $(FILES_PATH)/$*
+ 
+ SONIC_CLEAN_TARGETS += $(addsuffix -clean,$(addprefix $(TARGET_PATH)/, \
+@@ -790,23 +897,23 @@ SONIC_CLEAN_TARGETS += $(addsuffix -clean,$(addprefix $(TARGET_PATH)/, \
+ 		       $(SONIC_DOCKER_DBG_IMAGES) \
+ 		       $(SONIC_SIMPLE_DOCKER_IMAGES) \
+ 		       $(SONIC_INSTALLERS)))
+-$(SONIC_CLEAN_TARGETS) : $(TARGET_PATH)/%-clean : .platform
++$(SONIC_CLEAN_TARGETS) :: $(TARGET_PATH)/%-clean : .platform
+ 	@rm -f $(TARGET_PATH)/$*
+ 
+ SONIC_CLEAN_STDEB_DEBS = $(addsuffix -clean,$(addprefix $(PYTHON_DEBS_PATH)/, \
+ 		     $(SONIC_PYTHON_STDEB_DEBS)))
+-$(SONIC_CLEAN_STDEB_DEBS) : $(PYTHON_DEBS_PATH)/%-clean : .platform
++$(SONIC_CLEAN_STDEB_DEBS) :: $(PYTHON_DEBS_PATH)/%-clean : .platform
+ 	@rm -f $(PYTHON_DEBS_PATH)/$*
+ 
+ SONIC_CLEAN_WHEELS = $(addsuffix -clean,$(addprefix $(PYTHON_WHEELS_PATH)/, \
+ 		     $(SONIC_PYTHON_WHEELS)))
+-$(SONIC_CLEAN_WHEELS) : $(PYTHON_WHEELS_PATH)/%-clean : .platform
++$(SONIC_CLEAN_WHEELS) :: $(PYTHON_WHEELS_PATH)/%-clean : .platform
+ 	@rm -f $(PYTHON_WHEELS_PATH)/$*
+ 
+-clean-logs : .platform
++clean-logs :: .platform
+ 	@rm -f $(TARGET_PATH)/*.log $(DEBS_PATH)/*.log $(FILES_PATH)/*.log $(PYTHON_DEBS_PATH)/*.log $(PYTHON_WHEELS_PATH)/*.log
+ 
+-clean : .platform clean-logs $$(SONIC_CLEAN_DEBS) $$(SONIC_CLEAN_FILES) $$(SONIC_CLEAN_TARGETS) $$(SONIC_CLEAN_STDEB_DEBS) $$(SONIC_CLEAN_WHEELS)
++clean :: .platform clean-logs $$(SONIC_CLEAN_DEBS) $$(SONIC_CLEAN_FILES) $$(SONIC_CLEAN_TARGETS) $$(SONIC_CLEAN_STDEB_DEBS) $$(SONIC_CLEAN_WHEELS)
+ 
+ ###############################################################################
+ ## all
+-- 
+2.7.4
+

@@ -1,0 +1,97 @@
+From a121882afdcad7dcac7f56660ccdfc9bf1cbbe1b Mon Sep 17 00:00:00 2001
+From: Thomas Besemer <tbesemer@juniper.net>
+Date: Mon, 3 Aug 2020 14:44:46 -0700
+Subject: [PATCH 2/2] Juniper Specific Cache Configuration.
+
+---
+ rules/config              | 4 ++--
+ rules/linux-kernel.dep    | 2 +-
+ rules/sairedis.dep        | 2 +-
+ rules/sonic-utilities.dep | 2 +-
+ rules/swss-common.dep     | 2 +-
+ rules/swss.dep            | 2 +-
+ 6 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/rules/config b/rules/config
+index d0e322f..79b0d7d 100644
+--- a/rules/config
++++ b/rules/config
+@@ -105,8 +105,8 @@ FRR_USER_GID = 300
+ #	rcache  :  Use cache if exists, but dont update the cache
+ #	cache   :  Same as rwcache
+ # SONIC_DPKG_CACHE_SOURCE - Stores the cache location details
+-SONIC_DPKG_CACHE_METHOD ?= none
+-SONIC_DPKG_CACHE_SOURCE ?= /var/cache/sonic/artifacts
++SONIC_DPKG_CACHE_METHOD ?= rcache
++SONIC_DPKG_CACHE_SOURCE ?= /volume/sonic-mirror/distros/cache/jnpr_201911_0708a
+ 
+ # Default VS build memory preparation
+ DEFAULT_VS_PREPARE_MEM = yes
+diff --git a/rules/linux-kernel.dep b/rules/linux-kernel.dep
+index 6063ddd..80e0f7c 100644
+--- a/rules/linux-kernel.dep
++++ b/rules/linux-kernel.dep
+@@ -7,7 +7,7 @@ SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
+ DEP_FLAGS := $(SONIC_COMMON_FLAGS_LIST) \
+ 	         $(KERNEL_PROCURE_METHOD) $(KERNEL_CACHE_PATH) 
+ 
+-$(LINUX_HEADERS_COMMON)_CACHE_MODE  := GIT_CONTENT_SHA
++$(LINUX_HEADERS_COMMON)_CACHE_MODE  := none
+ $(LINUX_HEADERS_COMMON)_DEP_FLAGS   := $(DEP_FLAGS)
+ $(LINUX_HEADERS_COMMON)_DEP_FILES   := $(DEP_FILES)
+ $(LINUX_HEADERS_COMMON)_SMDEP_FILES := $(SMDEP_FILES)
+diff --git a/rules/sairedis.dep b/rules/sairedis.dep
+index f501a78..dc2a68e 100644
+--- a/rules/sairedis.dep
++++ b/rules/sairedis.dep
+@@ -9,7 +9,7 @@ $(foreach path, $(SMDEP_PATHS), $(eval $(path) :=$(filter-out $(SMDEP_PATHS),$(a
+ 					$(shell cd $(path)  && git ls-files | grep -v " ")))))
+ 
+ 
+-$(LIBSAIREDIS)_CACHE_MODE  := GIT_CONTENT_SHA
++$(LIBSAIREDIS)_CACHE_MODE  := none
+ $(LIBSAIREDIS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
+ $(LIBSAIREDIS)_DEP_FILES   := $(DEP_FILES)
+ $(LIBSAIREDIS)_SMDEP_FILES := $(foreach path, $(SMDEP_PATHS), $($(path)))
+diff --git a/rules/sonic-utilities.dep b/rules/sonic-utilities.dep
+index 9d5f64e..e78137e 100644
+--- a/rules/sonic-utilities.dep
++++ b/rules/sonic-utilities.dep
+@@ -4,7 +4,7 @@ DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/sonic-utilities.mk rules/sonic-u
+ DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
+ SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
+ 
+-$(SONIC_UTILS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SONIC_UTILS)_CACHE_MODE  := none 
+ $(SONIC_UTILS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
+ $(SONIC_UTILS)_DEP_FILES   := $(DEP_FILES)
+ $(SONIC_UTILS)_SMDEP_FILES := $(SMDEP_FILES)
+diff --git a/rules/swss-common.dep b/rules/swss-common.dep
+index b4e95a9..67b5af4 100644
+--- a/rules/swss-common.dep
++++ b/rules/swss-common.dep
+@@ -4,7 +4,7 @@ DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/swss-common.mk rules/swss-common
+ DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
+ SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
+ 
+-$(LIBSWSSCOMMON)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(LIBSWSSCOMMON)_CACHE_MODE  := none 
+ $(LIBSWSSCOMMON)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
+ $(LIBSWSSCOMMON)_DEP_FILES   := $(DEP_FILES)
+ $(LIBSWSSCOMMON)_SMDEP_FILES := $(SMDEP_FILES)
+diff --git a/rules/swss.dep b/rules/swss.dep
+index e57a9e7..65e4e02 100644
+--- a/rules/swss.dep
++++ b/rules/swss.dep
+@@ -4,7 +4,7 @@ DEP_FILES   := $(SONIC_COMMON_FILES_LIST) rules/swss.mk rules/swss.dep
+ DEP_FILES   += $(SONIC_COMMON_BASE_FILES_LIST)
+ SMDEP_FILES := $(addprefix $(SPATH)/,$(shell cd $(SPATH) && git ls-files))
+ 
+-$(SWSS)_CACHE_MODE  := GIT_CONTENT_SHA 
++$(SWSS)_CACHE_MODE  := none 
+ $(SWSS)_DEP_FLAGS   := $(SONIC_COMMON_FLAGS_LIST)
+ $(SWSS)_DEP_FILES   := $(DEP_FILES)
+ $(SWSS)_SMDEP_FILES := $(SMDEP_FILES)
+-- 
+2.7.4
+
